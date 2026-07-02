@@ -57,7 +57,7 @@ land there before being sorted.
 | **Label & Skin** | Walk your whole library: classify each model, rename it to `[BaseModel]-Friendly Name`, and grab a preview if missing. Safe to run repeatedly; already-named files are skipped. |
 | **Sort Only** | Move loose files out of `Downloaded Content` into the right model folder (VAEs, LoRAs, checkpoints). |
 | **Repair Asset** | Fix one asset by hand. Search your library, pick a file, and correct its base model, name, keywords, or preview. |
-| **Add Asset** | Register a file that did not come from Civitai (HuggingFace, TensorHub, a local merge). It gets labeled and skinned, and added to the exclusion list so the auto-pass leaves it alone. |
+| **Add Asset** | Register a file that did not come from Civitai (HuggingFace, TensorArt, a local merge). It gets labeled and skinned, and added to the exclusion list so the auto-pass leaves it alone. |
 | **Configuration** | Set the three model folder paths. |
 | **Save Key** | Store your Civitai API key. |
 
