@@ -1,6 +1,19 @@
+<p align="center">
+  <img width="448" height="560" alt="Codeman, the Re:Tentative mascot" src="https://github.com/user-attachments/assets/99da5453-5993-4993-8aac-51c0a4b6510c" />
+</p>
+
 # Re:Tentative
 
 **Stable Diffusion Model Manager** · Beta
+
+<p align="center">
+  <img alt="status: beta" src="https://img.shields.io/badge/status-beta-e8a33d">
+  <img alt="python 3" src="https://img.shields.io/badge/python-3-3776ab">
+  <img alt="dependencies: none" src="https://img.shields.io/badge/dependencies-none-9fb87a">
+  <img alt="gui: tkinter" src="https://img.shields.io/badge/gui-tkinter-74b8b8">
+  <img alt="domain: generative AI" src="https://img.shields.io/badge/generative%20AI-image%20models-b07ad6">
+  <img alt="platforms" src="https://img.shields.io/badge/platforms-Windows%20%C2%B7%20Linux%20%C2%B7%20macOS-8aa6d6">
+</p>
 
 A single-file Python desktop app that keeps a local Stable Diffusion model
 library tidy. It classifies your checkpoints and LoRAs by base model, renames
