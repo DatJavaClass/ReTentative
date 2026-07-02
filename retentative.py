@@ -1,0 +1,1461 @@
+#!/usr/bin/env python3
+"""
+Re:Tentative - Stable Diffusion Model Manager  [Beta]
+=====================================================
+
+A single-file tool to keep a local Stable Diffusion model library tidy:
+it classifies checkpoints and LoRAs by their base model, renames them to a
+consistent [BaseModel]-Friendly Name format, grabs a preview image when one
+is missing, sorts freshly-downloaded files into the right folders, and offers
+a small Civitai download manager.
+
+FIRST RUN
+  On first launch with no saved configuration, the tool opens the
+  Configuration dialog so you can point it at your three model folders
+  (Checkpoints, LoRA, VAE). After that it asks for your Civitai API key.
+  It also creates, next to this script, empty working files:
+      _exclusion_list.txt   _unresolved.txt   _skip_cache.json
+      sd_mm_config.json     Downloaded Content/   (empty folder)
+
+WHAT THE BUTTONS DO   (see the ? Help button in-app for the full README)
+  Add            menu: Add Clipboard / Add Batch (a .txt of URLs)
+  Remove         drop the selected queue item
+  Begin Download fetch the queue, sort, then label + skin the new files
+  Cancel         stop after the current file
+  Label & Skin   walk your library: classify, rename, grab missing previews
+  Sort Only      route loose files from Downloaded Content into model folders
+  Repair Asset   fix one asset by hand (search, edit fields, re-skin)
+  Add Asset      register a non-Civitai file (HuggingFace/TensorHub); it is
+                 labeled/skinned AND added to the exclusion list
+  Configuration  set your model folder paths
+  Save Key       store your Civitai API key
+  ?              open the in-app README
+
+CLASSIFICATION (per file, in order)
+  LoRAs        -> read baseModel from the .civitai.info sidecar (usually present)
+  Checkpoints  -> no sidecar, so SHA-256 the file and ask Civitai by-hash
+  Fallback     -> scrape the model page for baseModel
+  None of these-> QUARANTINE: leave the file untouched, log to _unresolved.txt
+
+The tool never guesses a base model from a filename. Anything it cannot resolve
+from an authoritative source is left alone and logged, so a wrong label is never
+written silently.
+
+NOTE ON A1111 / FORGE ETC.
+  Renaming model files changes the strings stored in prior image metadata and
+  in any saved styles or workflows that reference those files. This is expected;
+  refresh your UI's model lists after a run.
+"""
+
+import os
+import sys
+import re
+import json
+import time
+import hashlib
+import threading
+import urllib.request
+import urllib.error
+import urllib.parse
+
+# ----------------------------------------------------------------------------
+# PATHS
+#   Everything working (config, lists, Downloaded Content) lives next to THIS
+#   script -- tight and predictable. Model folders are user-configured and
+#   stored in sd_mm_config.json; they are EMPTY until the user sets them.
+# ----------------------------------------------------------------------------
+SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_PATH     = os.path.join(SCRIPT_DIR, "sd_mm_config.json")
+EXCLUSION_PATH  = os.path.join(SCRIPT_DIR, "_exclusion_list.txt")
+UNRESOLVED_PATH = os.path.join(SCRIPT_DIR, "_unresolved.txt")
+SKIPCACHE_PATH  = os.path.join(SCRIPT_DIR, "_skip_cache.json")
+DOWNLOAD_DIR    = os.path.join(SCRIPT_DIR, "Downloaded Content")
+
+# ----------------------------------------------------------------------------
+# CIVITAI ENDPOINTS
+# ----------------------------------------------------------------------------
+BY_HASH    = "https://civitai.com/api/v1/model-versions/by-hash/{}"
+MODEL_PAGE = "https://civitai.com/models/{}"
+
+# ----------------------------------------------------------------------------
+# BASE MODEL -> BRACKET TAG  (formatting only; NOT a gate on allowed values)
+#   Maps known Civitai baseModel strings to a tidy bracket tag. Anything not
+#   listed passes through verbatim as [Whatever] -- so a brand-new base model
+#   is handled with no code change; it just isn't prettified.
+# ----------------------------------------------------------------------------
+TAG_MAP = {
+    "illustrious":          "[Illustrious]",
+    "pony":                 "[Pony]",
+    "anima":                "[Anima]",
+    "sdxl 1.0":             "[SDXL 1.0]",
+    "sdxl":                 "[SDXL 1.0]",
+    "stable diffusion xl":  "[SDXL 1.0]",
+    "sd 1.5":               "[SD 1.5]",
+    "stable diffusion 1.5": "[SD 1.5]",
+    "noobai":               "[NoobAI]",
+    "flux.1 d":             "[Flux]",
+    "flux.1 s":             "[Flux]",
+}
+
+MODEL_EXTS = {".safetensors", ".ckpt", ".pt"}
+
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+def default_config():
+    return {"api_key": "", "ckpt_dir": "", "lora_dir": "", "vae_dir": ""}
+
+
+def load_config():
+    if os.path.isfile(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            base = default_config()
+            base.update(cfg)
+            return base
+        except Exception:
+            pass
+    return default_config()
+
+
+def save_config(cfg):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def paths_configured(cfg):
+    """True only if all three model folders are set and exist."""
+    for key in ("ckpt_dir", "lora_dir", "vae_dir"):
+        p = cfg.get(key, "")
+        if not p or not os.path.isdir(p):
+            return False
+    return True
+
+
+# ============================================================================
+# FIRST-RUN SCAFFOLDING
+# ============================================================================
+DEFAULT_EXCLUSIONS = []   # release ships with an EMPTY exclusion list
+
+
+def ensure_working_files():
+    """Create the empty working files and Downloaded Content folder if absent.
+    Idempotent -- never overwrites an existing file."""
+    if not os.path.isfile(EXCLUSION_PATH):
+        with open(EXCLUSION_PATH, "w", encoding="utf-8") as f:
+            f.write("# One filename stem per line. Lines starting with # are ignored.\n")
+            f.write("# Files matching these stems are skipped entirely by the tool:\n")
+            f.write("# no hashing, no renaming, no unresolved-log entries.\n")
+            f.write("# Add non-Civitai files (local merges, hand-trained, HuggingFace,\n")
+            f.write("# TensorHub) here so the auto-pass leaves them alone.\n")
+            f.write("# Example (delete or replace):\n")
+            f.write("# myLocalMerge_v1\n")
+    if not os.path.isfile(UNRESOLVED_PATH):
+        open(UNRESOLVED_PATH, "w", encoding="utf-8").close()
+    if not os.path.isfile(SKIPCACHE_PATH):
+        with open(SKIPCACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump([], f)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+# ============================================================================
+# EXCLUSION LIST
+# ============================================================================
+def load_exclusions():
+    """Return a set of lowercased, normalized stems to skip."""
+    ensure_working_files()
+    stems = set()
+    with open(EXCLUSION_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                stems.add(normalize_stem(line))
+    return stems
+
+
+def add_to_exclusions(stem):
+    """Append a stem to the exclusion list if not already present."""
+    ensure_working_files()
+    existing = set()
+    with open(EXCLUSION_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s and not s.startswith("#"):
+                existing.add(normalize_stem(s))
+    if normalize_stem(stem) in existing:
+        return False
+    with open(EXCLUSION_PATH, "a", encoding="utf-8") as f:
+        f.write(stem + "\n")
+    return True
+
+
+def normalize_stem(name):
+    """Drop extension, drop trailing kohya step suffix (-000014), lowercase."""
+    stem = os.path.splitext(name)[0]
+    stem = re.sub(r"-0*\d{4,6}$", "", stem)
+    return stem.strip().lower()
+
+
+# ============================================================================
+# HTTP HELPERS  (short timeouts; never hang a batch run)
+# ============================================================================
+def http_get_json(url, api_key=None, timeout=8, retries=2):
+    req = urllib.request.Request(url, headers={"User-Agent": "retentative/1.0"})
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+                last_err = e
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(0.5)
+                continue
+            raise
+    if last_err:
+        raise last_err
+
+
+def http_download(url, dest_path, api_key=None, timeout=120, cancel_flag=None,
+                  progress=None):
+    req = urllib.request.Request(url, headers={"User-Agent": "retentative/1.0"})
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        total = int(resp.headers.get("Content-Length", 0))
+        done = 0
+        tmp = dest_path + ".part"
+        with open(tmp, "wb") as out:
+            while True:
+                if cancel_flag is not None and cancel_flag.is_set():
+                    out.close()
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                    return False
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if progress and total:
+                    progress(done / total)
+        os.replace(tmp, dest_path)
+    return True
+
+
+def sha256_file(path, cancel_flag=None):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            if cancel_flag is not None and cancel_flag.is_set():
+                return None
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def decamel(stem):
+    s = stem.replace("_", " ").replace("-", " ")
+    s = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s)
+    s = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def sanitize_filename(name):
+    return re.sub(r'[<>:"/\\|?*]', "", name).strip()
+
+
+def tag_for_base_model(base_model):
+    if not base_model:
+        return None
+    key = base_model.strip().lower()
+    if key in TAG_MAP:
+        return TAG_MAP[key]
+    return "[" + base_model.strip() + "]"
+
+
+def log_unresolved(path, tried, reason):
+    with open(UNRESOLVED_PATH, "a", encoding="utf-8") as f:
+        f.write(f"{path}\n    tried: {tried}\n    reason: {reason}\n\n")
+
+
+def load_skip_cache():
+    if os.path.isfile(SKIPCACHE_PATH):
+        try:
+            with open(SKIPCACHE_PATH, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+
+def save_skip_cache(stems):
+    try:
+        with open(SKIPCACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(sorted(stems), f, indent=2)
+    except Exception:
+        pass
+
+
+# ============================================================================
+# SIDECAR / CLASSIFICATION
+# ============================================================================
+def read_sidecar(model_path):
+    sidecar = os.path.splitext(model_path)[0] + ".civitai.info"
+    if not os.path.isfile(sidecar):
+        return None, None, None
+    try:
+        with open(sidecar, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None, None, None
+    base = data.get("baseModel")
+    name = (data.get("model") or {}).get("name")
+    images = data.get("images") or []
+    return base, name, images
+
+
+def classify_by_hash(model_path, api_key, cancel_flag=None):
+    digest = sha256_file(model_path, cancel_flag=cancel_flag)
+    if digest is None:
+        return None
+    try:
+        data = http_get_json(BY_HASH.format(digest), api_key=api_key)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        return None
+    except Exception:
+        return None
+    return {
+        "base_model": data.get("baseModel"),
+        "model_name": (data.get("model") or {}).get("name"),
+        "images": data.get("images") or [],
+        "model_id": data.get("modelId"),
+    }
+
+
+def scrape_data_next_head(model_id, api_key=None):
+    if not model_id:
+        return None
+    try:
+        url = MODEL_PAGE.format(model_id)
+        req = urllib.request.Request(url, headers={"User-Agent": "retentative/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    for pat in (r'"baseModel"\s*:\s*"([^"]+)"',
+                r'data-next-head[^>]*baseModel[^>]*?"([^"]+)"'):
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return None
+
+
+def pick_preview_url(images):
+    for img in images:
+        u = img.get("url")
+        if u:
+            return u
+    return None
+
+
+def resolve_model(model_path, api_key, cancel_flag=None):
+    tried = []
+    base, name, images = read_sidecar(model_path)
+    if base:
+        return {
+            "base_model": base,
+            "tag": tag_for_base_model(base),
+            "model_name": name,
+            "preview_url": pick_preview_url(images),
+            "source": "sidecar",
+        }
+    tried.append("sidecar(absent)")
+
+    if not api_key:
+        tried.append("hash(skipped: no API key)")
+        log_unresolved(model_path, tried,
+                       "no sidecar and no API key -> cannot classify")
+        return None
+    hit = classify_by_hash(model_path, api_key, cancel_flag=cancel_flag)
+    if hit and hit.get("base_model"):
+        return {
+            "base_model": hit["base_model"],
+            "tag": tag_for_base_model(hit["base_model"]),
+            "model_name": hit.get("model_name"),
+            "preview_url": pick_preview_url(hit.get("images") or []),
+            "source": "hash",
+        }
+
+    if hit and hit.get("model_id"):
+        tried.append("hash(no baseModel)")
+        scraped = scrape_data_next_head(hit["model_id"], api_key=api_key)
+        if scraped:
+            return {
+                "base_model": scraped,
+                "tag": tag_for_base_model(scraped),
+                "model_name": hit.get("model_name"),
+                "preview_url": pick_preview_url(hit.get("images") or []),
+                "source": "scrape",
+            }
+        tried.append("scrape(failed)")
+    else:
+        tried.append("hash(404)")
+
+    hint = decamel(os.path.splitext(os.path.basename(model_path))[0])
+    log_unresolved(
+        model_path, tried,
+        f"not resolvable from any authoritative source; "
+        f"filename hint only (NOT applied): {hint!r}")
+    return None
+
+
+# ============================================================================
+# RENAME / PREVIEW
+# ============================================================================
+def build_new_stem(tag, model_name, original_stem):
+    friendly = model_name.strip() if model_name else decamel(original_stem)
+    friendly = sanitize_filename(friendly)
+    MAX_FRIENDLY = 80   # keep full path under Windows MAX_PATH (~260)
+    if len(friendly) > MAX_FRIENDLY:
+        friendly = friendly[:MAX_FRIENDLY].rstrip()
+    return f"{tag}-{friendly}"
+
+
+def already_formatted(stem):
+    return bool(re.match(r"^\[[^\]]+\]-", stem))
+
+
+def rename_with_siblings(model_path, new_stem):
+    folder = os.path.dirname(model_path)
+    old_stem = os.path.splitext(os.path.basename(model_path))[0]
+    results = []
+    for fname in os.listdir(folder):
+        if fname == old_stem or fname.startswith(old_stem + "."):
+            suffix = fname[len(old_stem):]
+            src = os.path.join(folder, fname)
+            dst = os.path.join(folder, new_stem + suffix)
+            if os.path.abspath(src) == os.path.abspath(dst):
+                continue
+            if os.path.exists(dst):
+                continue
+            try:
+                os.rename(src, dst)
+                results.append((fname, new_stem + suffix))
+            except OSError as e:
+                log_unresolved(
+                    src, ["rename"],
+                    f"os.rename failed ({e.__class__.__name__}: {e}); "
+                    f"target was {new_stem + suffix!r}")
+    return results
+
+
+def has_preview(model_path):
+    stem = os.path.splitext(model_path)[0]
+    for ext in (".preview.png", ".preview.jpg", ".preview.jpeg"):
+        if os.path.isfile(stem + ext):
+            return True
+    return False
+
+
+def grab_preview(model_path, preview_url, api_key, cancel_flag=None):
+    if not preview_url or has_preview(model_path):
+        return False
+    dest = os.path.splitext(model_path)[0] + ".preview.png"
+    try:
+        return http_download(preview_url, dest, api_key=api_key,
+                             cancel_flag=cancel_flag)
+    except Exception:
+        return False
+
+
+# ============================================================================
+# LABEL & SKIN  (the library normalizer)
+# ============================================================================
+def iter_model_files(folder):
+    if not folder or not os.path.isdir(folder):
+        return
+    for fname in os.listdir(folder):
+        ext = os.path.splitext(fname)[1].lower()
+        if ext in MODEL_EXTS:
+            yield os.path.join(folder, fname)
+
+
+def label_and_skin(cfg, log=print, cancel_flag=None):
+    if not paths_configured(cfg):
+        log("Model folders are not configured. Open Configuration first.")
+        return None
+    api_key = cfg.get("api_key", "")
+    exclusions = load_exclusions()
+    skip_cache = load_skip_cache()
+    open(UNRESOLVED_PATH, "w", encoding="utf-8").close()
+
+    counts = {"renamed": 0, "previewed": 0, "skipped_excluded": 0,
+              "skipped_formatted": 0, "skipped_cached": 0,
+              "unresolved": 0, "errors": 0}
+
+    folders = ((cfg["ckpt_dir"], "checkpoint"), (cfg["lora_dir"], "lora"))
+    for folder, label in folders:
+        log(f"\n=== {label.upper()}S in {folder} ===")
+        for model_path in iter_model_files(folder):
+            if cancel_flag is not None and cancel_flag.is_set():
+                log("Cancelled.")
+                return counts
+            fname = os.path.basename(model_path)
+            stem = os.path.splitext(fname)[0]
+            nstem = normalize_stem(fname)
+
+            if nstem in exclusions:
+                counts["skipped_excluded"] += 1
+                log(f"  skip (excluded): {fname}")
+                continue
+            if already_formatted(stem):
+                counts["skipped_formatted"] += 1
+                continue
+            if nstem in skip_cache and read_sidecar(model_path)[0] is None:
+                counts["skipped_cached"] += 1
+                log(f"  skip (cached-miss): {fname}")
+                continue
+
+            try:
+                info = resolve_model(model_path, api_key, cancel_flag=cancel_flag)
+            except Exception as e:
+                counts["errors"] += 1
+                log(f"  ERROR {fname}: {e}")
+                continue
+
+            if info is None:
+                counts["unresolved"] += 1
+                skip_cache.add(nstem)
+                log(f"  UNRESOLVED (quarantined): {fname}")
+                continue
+
+            new_stem = build_new_stem(info["tag"], info["model_name"], stem)
+            if grab_preview(model_path, info["preview_url"], api_key,
+                            cancel_flag=cancel_flag):
+                counts["previewed"] += 1
+                log(f"  preview grabbed: {fname}")
+            moved = rename_with_siblings(model_path, new_stem)
+            if moved:
+                counts["renamed"] += 1
+                log(f"  {info['source']:>7} | {fname}  ->  {new_stem}")
+
+    save_skip_cache(skip_cache)
+    log("\n=== SUMMARY ===")
+    for k, v in counts.items():
+        log(f"  {k:20s}: {v}")
+    log(f"\nUnresolved (if any): {UNRESOLVED_PATH}")
+    return counts
+
+
+# ============================================================================
+# SORTER  (VAE checked before checkpoint)
+# ============================================================================
+KNOWN_VAE_NAMES = {"sdxl.vae", "qwen_image_vae", "vae-ft-mse-840000-ema-pruned"}
+
+
+def is_vae(fname):
+    stem = os.path.splitext(fname)[0].lower()
+    if stem in KNOWN_VAE_NAMES:
+        return True
+    return "vae" in stem
+
+
+def is_lora(model_path):
+    sidecar = os.path.splitext(model_path)[0] + ".civitai.info"
+    if os.path.isfile(sidecar):
+        try:
+            with open(sidecar, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            t = (data.get("model") or {}).get("type", "")
+            if t.upper() == "LORA":
+                return True
+            if t.upper() == "CHECKPOINT":
+                return False
+        except Exception:
+            pass
+    try:
+        size_mb = os.path.getsize(model_path) / (1024 * 1024)
+        return size_mb < 500
+    except OSError:
+        return False
+
+
+def destination_for(model_path, cfg):
+    fname = os.path.basename(model_path)
+    if is_vae(fname):
+        return cfg["vae_dir"]
+    if is_lora(model_path):
+        return cfg["lora_dir"]
+    return cfg["ckpt_dir"]
+
+
+def sort_downloads(cfg, log=print, cancel_flag=None):
+    if not paths_configured(cfg):
+        log("Model folders are not configured. Open Configuration first.")
+        return 0
+    if not os.path.isdir(DOWNLOAD_DIR):
+        log(f"No download dir: {DOWNLOAD_DIR}")
+        return 0
+    moved = 0
+    for fname in list(os.listdir(DOWNLOAD_DIR)):
+        if cancel_flag is not None and cancel_flag.is_set():
+            log("Sort cancelled.")
+            break
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in MODEL_EXTS:
+            continue
+        src = os.path.join(DOWNLOAD_DIR, fname)
+        dest_dir = destination_for(src, cfg)
+        os.makedirs(dest_dir, exist_ok=True)
+        stem = os.path.splitext(fname)[0]
+        for sib in list(os.listdir(DOWNLOAD_DIR)):
+            sstem = os.path.splitext(sib)[0]
+            if sib == fname or sstem == stem or sib.startswith(stem + "."):
+                s = os.path.join(DOWNLOAD_DIR, sib)
+                d = os.path.join(dest_dir, sib)
+                if not os.path.exists(d):
+                    os.rename(s, d)
+        moved += 1
+        log(f"  sorted -> {os.path.basename(dest_dir)}: {fname}")
+    return moved
+
+
+# ============================================================================
+# CIVITAI URL / DOWNLOAD
+# ============================================================================
+def civitai_version_id_from_url(url):
+    url = url.strip()
+    q = urllib.parse.urlparse(url)
+    params = urllib.parse.parse_qs(q.query)
+    if "modelVersionId" in params:
+        return ("version", params["modelVersionId"][0])
+    m = re.search(r"/api/download/models/(\d+)", url)
+    if m:
+        return ("version", m.group(1))
+    m = re.search(r"/models/(\d+)", url)
+    if m:
+        return ("model", m.group(1))
+    return (None, None)
+
+
+def resolve_download_url(kind, cid, api_key):
+    if kind == "version":
+        data = http_get_json(
+            f"https://civitai.com/api/v1/model-versions/{cid}", api_key=api_key)
+    else:
+        data = http_get_json(
+            f"https://civitai.com/api/v1/models/{cid}", api_key=api_key)
+        versions = data.get("modelVersions") or []
+        if not versions:
+            return None, None
+        data = versions[0]
+    files = data.get("files") or []
+    primary = next((f for f in files if f.get("primary")),
+                   files[0] if files else None)
+    if not primary:
+        return None, None
+    return primary.get("downloadUrl"), primary.get("name")
+
+
+def fetch_metadata_by_url(url, api_key):
+    kind, cid = civitai_version_id_from_url(url)
+    if not cid:
+        return None
+    try:
+        if kind == "version":
+            data = http_get_json(
+                f"https://civitai.com/api/v1/model-versions/{cid}", api_key=api_key)
+        else:
+            mdata = http_get_json(
+                f"https://civitai.com/api/v1/models/{cid}", api_key=api_key)
+            versions = mdata.get("modelVersions") or []
+            if not versions:
+                return None
+            data = versions[0]
+            data.setdefault("model", {})["name"] = mdata.get("name")
+    except Exception:
+        return None
+    return {
+        "base_model": data.get("baseModel"),
+        "model_name": (data.get("model") or {}).get("name"),
+        "preview_url": pick_preview_url(data.get("images") or []),
+        "keywords": data.get("trainedWords") or [],
+    }
+
+
+# ============================================================================
+# MANUAL ASSET HELPERS  (Repair / Add forms)
+# ============================================================================
+def scan_known_base_models(cfg):
+    """Derive the base-model dropdown from what the library actually contains,
+    plus common defaults. A brand-new base model appears automatically once a
+    file carrying it exists; 'Other...' covers the not-yet-present case."""
+    found = set()
+    for key in ("ckpt_dir", "lora_dir"):
+        folder = cfg.get(key, "")
+        if not folder or not os.path.isdir(folder):
+            continue
+        for fname in os.listdir(folder):
+            if not fname.endswith(".civitai.info"):
+                continue
+            try:
+                with open(os.path.join(folder, fname), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                bm = data.get("baseModel")
+                if bm:
+                    found.add(bm.strip())
+            except Exception:
+                continue
+    for pretty in ("Illustrious", "Pony", "Anima", "SDXL 1.0",
+                   "SD 1.5", "NoobAI", "Flux"):
+        found.add(pretty)
+    return sorted(found, key=str.lower)
+
+
+def find_model_file(stem_or_name, folder):
+    if not folder or not os.path.isdir(folder):
+        return None
+    for ext in MODEL_EXTS:
+        cand = os.path.join(folder, stem_or_name + ext)
+        if os.path.isfile(cand):
+            return cand
+    target = os.path.splitext(stem_or_name)[0]
+    for fname in os.listdir(folder):
+        ext = os.path.splitext(fname)[1].lower()
+        if ext in MODEL_EXTS and os.path.splitext(fname)[0] == target:
+            return os.path.join(folder, fname)
+    return None
+
+
+def list_model_stems(folder):
+    out = []
+    if not folder or not os.path.isdir(folder):
+        return out
+    for fname in os.listdir(folder):
+        ext = os.path.splitext(fname)[1].lower()
+        if ext in MODEL_EXTS:
+            out.append(os.path.splitext(fname)[0])
+    return sorted(out, key=str.lower)
+
+
+def asset_status(model_path):
+    base, name, images = read_sidecar(model_path)
+    sidecar = os.path.splitext(model_path)[0] + ".civitai.info"
+    keywords = []
+    if os.path.isfile(sidecar):
+        try:
+            with open(sidecar, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            keywords = data.get("trainedWords") or []
+        except Exception:
+            pass
+    return {
+        "has_sidecar": os.path.isfile(sidecar),
+        "has_preview": has_preview(model_path),
+        "base_model": base,
+        "model_name": name,
+        "keywords": keywords,
+    }
+
+
+def write_keywords_to_sidecar(model_path, keywords):
+    sidecar = os.path.splitext(model_path)[0] + ".civitai.info"
+    data = {}
+    if os.path.isfile(sidecar):
+        try:
+            with open(sidecar, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data["trainedWords"] = keywords
+    try:
+        with open(sidecar, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def apply_manual_asset(model_path, tag, friendly, keywords, preview_source,
+                       api_key=None, make_exclusion=False, log=print):
+    if not os.path.isfile(model_path):
+        return False, f"Model file not found: {model_path}"
+    if keywords:
+        write_keywords_to_sidecar(model_path, keywords)
+    if preview_source:
+        dest = os.path.splitext(model_path)[0] + ".preview.png"
+        src = preview_source.strip().strip('"')
+        try:
+            if src.lower().startswith(("http://", "https://")):
+                http_download(src, dest, api_key=api_key)
+                log("  preview downloaded from URL")
+            elif os.path.isfile(src):
+                import shutil
+                shutil.copyfile(src, dest)
+                log("  preview copied from local file")
+            else:
+                log(f"  ! preview source not a URL or existing file: {src}")
+        except Exception as e:
+            log(f"  ! preview failed: {e}")
+    new_stem = build_new_stem(tag, friendly,
+                              os.path.splitext(os.path.basename(model_path))[0])
+    moved = rename_with_siblings(model_path, new_stem)
+    if make_exclusion and add_to_exclusions(new_stem):
+        log(f"  added to exclusion list: {new_stem}")
+    if moved:
+        return True, f"Applied: {new_stem}"
+    return True, f"Metadata applied; filename unchanged: {new_stem}"
+
+
+# ============================================================================
+# GUI
+# ============================================================================
+README_TEXT = """\
+Re:Tentative - Stable Diffusion Model Manager  [Beta]
+
+WHAT IT DOES
+  Keeps a local Stable Diffusion model library tidy. It classifies your
+  checkpoints and LoRAs by base model, renames them to a consistent
+  [BaseModel]-Friendly Name format, downloads a preview image when one is
+  missing, sorts freshly-downloaded files into the correct folders, and
+  includes a small Civitai download queue.
+
+FIRST-TIME SETUP
+  1. Click Configuration and point the tool at your three model folders:
+     Checkpoints, LoRA, and VAE.
+  2. Paste your Civitai API key and click Save Key. The key lets the tool
+     read model metadata and download previews without rate-limit stalls.
+  A "Downloaded Content" folder is created next to this program; new
+  downloads land there before being sorted.
+
+THE BUTTONS
+  Add (menu)     Add Clipboard adds a Civitai URL from your clipboard to the
+                 queue. Add Batch loads a .txt file of URLs (one per line).
+  Remove         Remove the selected queue entry.
+  Begin Download Download everything in the queue into Downloaded Content,
+                 then sort and label/skin the new files automatically.
+  Cancel         Stop after the current file finishes.
+  Label & Skin   Walk your whole library: classify each model, rename it to
+                 [BaseModel]-Friendly Name, and grab a preview if missing.
+                 Safe to run repeatedly -- already-named files are skipped.
+  Sort Only      Move loose files out of Downloaded Content into the right
+                 model folder (VAEs, LoRAs, checkpoints).
+  Repair Asset   Fix one asset by hand. Search your library, pick a file, and
+                 correct its base model, name, keywords, or preview.
+  Add Asset      Register a file that did NOT come from Civitai (HuggingFace,
+                 TensorHub, a local merge). It gets labeled and skinned, and
+                 added to the exclusion list so the auto-pass leaves it alone.
+  Configuration  Set the three model folder paths.
+  Save Key       Store your Civitai API key.
+
+HOW CLASSIFICATION WORKS
+  For each file the tool tries, in order:
+    1. Read the base model from the file's .civitai.info sidecar (LoRAs).
+    2. If there's no sidecar (checkpoints), hash the file and ask Civitai
+       what it is by hash.
+    3. If that returns no base model, scrape the model page as a last resort.
+    4. If nothing works, the file is QUARANTINED: left completely untouched
+       and logged to _unresolved.txt. The tool never guesses a base model
+       from a filename, so it will never write a wrong label silently.
+
+FILES THE TOOL KEEPS  (all next to this program)
+  _exclusion_list.txt  Filename stems to skip entirely. Put non-Civitai files
+                       here so they aren't re-checked every run.
+  _unresolved.txt      A fresh report each run of files that couldn't be
+                       resolved -- your punch list for manual Repair.
+  _skip_cache.json     Remembers files that failed once, so big files aren't
+                       re-hashed every run. Delete it to force a full retry.
+  sd_mm_config.json    Your API key and folder paths.
+
+A NOTE ABOUT RENAMING
+  Renaming model files changes the strings your SD UI stored in older image
+  metadata and in any saved styles or workflows. This is expected. After a
+  run, click the refresh arrows on your UI's model lists so it re-reads the
+  new names.
+"""
+
+
+def open_config_dialog(parent, cfg, on_saved=None):
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+
+    win = tk.Toplevel(parent)
+    win.title("Configuration")
+    win.geometry("640x220")
+    win.resizable(False, False)
+    win.transient(parent)
+    win.grab_set()
+
+    pad = {"padx": 8, "pady": 8}
+    rows = [("Checkpoints folder:", "ckpt_dir"),
+            ("LoRA folder:", "lora_dir"),
+            ("VAE folder:", "vae_dir")]
+    vars_ = {}
+
+    for i, (label, key) in enumerate(rows):
+        ttk.Label(win, text=label).grid(row=i, column=0, sticky="w", **pad)
+        v = tk.StringVar(value=cfg.get(key, ""))
+        vars_[key] = v
+        ttk.Entry(win, textvariable=v, width=52).grid(row=i, column=1, sticky="we", **pad)
+
+        def make_browse(var=v, lbl=label):
+            def browse():
+                d = filedialog.askdirectory(title=f"Select {lbl}",
+                                            initialdir=var.get() or SCRIPT_DIR)
+                if d:
+                    var.set(d)
+            return browse
+        ttk.Button(win, text="Browse", command=make_browse()).grid(
+            row=i, column=2, **pad)
+
+    win.columnconfigure(1, weight=1)
+
+    def save():
+        for key in ("ckpt_dir", "lora_dir", "vae_dir"):
+            cfg[key] = vars_[key].get().strip()
+        save_config(cfg)
+        missing = [k for k in ("ckpt_dir", "lora_dir", "vae_dir")
+                   if not os.path.isdir(cfg.get(k, ""))]
+        if missing:
+            messagebox.showwarning(
+                "Saved with warnings",
+                "Saved, but one or more folders don't exist yet:\n" +
+                "\n".join(cfg[k] or "(blank)" for k in missing))
+        else:
+            messagebox.showinfo("Saved", "Folder paths saved.")
+        win.destroy()
+        if on_saved:
+            on_saved()
+
+    btns = ttk.Frame(win)
+    btns.grid(row=len(rows), column=0, columnspan=3, pady=8)
+    ttk.Button(btns, text="Save", command=save).pack(side="left", padx=4)
+    ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="left", padx=4)
+
+
+def open_help_dialog(parent):
+    import tkinter as tk
+    from tkinter import ttk
+
+    win = tk.Toplevel(parent)
+    win.title("Re:Tentative - Help / README")
+    win.geometry("680x640")
+    win.transient(parent)
+
+    frame = ttk.Frame(win, padding=8)
+    frame.pack(fill="both", expand=True)
+    txt = tk.Text(frame, wrap="word")
+    txt.pack(side="left", fill="both", expand=True)
+    sb = ttk.Scrollbar(frame, command=txt.yview)
+    sb.pack(side="right", fill="y")
+    txt.config(yscrollcommand=sb.set)
+    txt.insert("1.0", README_TEXT)
+    txt.config(state="disabled")
+
+
+def open_asset_form(parent, mode, cfg, log):
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog
+
+    api_key = cfg.get("api_key", "")
+    win = tk.Toplevel(parent)
+    win.title("Repair Asset" if mode == "repair" else "Add Asset")
+    win.geometry("620x600")
+    win.resizable(False, False)
+    win.transient(parent)
+
+    pad = {"padx": 8, "pady": 4}
+    OTHER = "Other... (type new)"
+
+    type_frame = ttk.Frame(win, padding=(8, 8, 8, 0))
+    type_frame.pack(fill="x")
+    ttk.Label(type_frame, text="Asset type:").pack(side="left")
+    type_var = tk.StringVar(value="Lora")
+    ttk.Radiobutton(type_frame, text="Lora", variable=type_var,
+                    value="Lora").pack(side="left", padx=6)
+    ttk.Radiobutton(type_frame, text="Checkpoint", variable=type_var,
+                    value="Checkpoint").pack(side="left", padx=6)
+
+    def folder_for_type():
+        return cfg["lora_dir"] if type_var.get() == "Lora" else cfg["ckpt_dir"]
+
+    body = ttk.Frame(win, padding=8)
+    body.pack(fill="both", expand=True)
+    selected_path = {"path": None}
+
+    if mode == "repair":
+        ttk.Label(body, text="Search asset:").grid(row=0, column=0, sticky="w", **pad)
+        search_var = tk.StringVar()
+        ttk.Entry(body, textvariable=search_var, width=48).grid(
+            row=0, column=1, sticky="we", **pad)
+        results_list = tk.Listbox(body, height=5)
+        results_list.grid(row=1, column=0, columnspan=2, sticky="we", **pad)
+
+        def refresh_results(*_):
+            q = search_var.get().strip().lower()
+            results_list.delete(0, "end")
+            for s in list_model_stems(folder_for_type()):
+                if q in s.lower():
+                    results_list.insert("end", s)
+        search_var.trace_add("write", refresh_results)
+        type_var.trace_add("write", refresh_results)
+        refresh_results()
+
+    status_var = tk.StringVar(value="")
+    if mode == "repair":
+        ttk.Label(body, textvariable=status_var, foreground="#555",
+                  justify="left", wraplength=560).grid(
+            row=2, column=0, columnspan=2, sticky="w", **pad)
+
+    base_row = 3 if mode == "repair" else 0
+
+    ttk.Label(body, text="Civitai URL:").grid(row=base_row, column=0, sticky="w", **pad)
+    url_var = tk.StringVar()
+    ttk.Entry(body, textvariable=url_var, width=42).grid(
+        row=base_row, column=1, sticky="we", **pad)
+
+    ttk.Label(body, text="Base model:").grid(row=base_row + 1, column=0, sticky="w", **pad)
+    base_choices = scan_known_base_models(cfg) + [OTHER]
+    base_var = tk.StringVar(value=base_choices[0])
+    ttk.Combobox(body, textvariable=base_var, values=base_choices,
+                 state="readonly", width=39).grid(
+        row=base_row + 1, column=1, sticky="we", **pad)
+    other_var = tk.StringVar()
+    other_entry = ttk.Entry(body, textvariable=other_var, width=42)
+
+    def on_base_change(*_):
+        if base_var.get() == OTHER:
+            other_entry.grid(row=base_row + 2, column=1, sticky="we", **pad)
+            ttk.Label(body, text="New base name:").grid(
+                row=base_row + 2, column=0, sticky="w", **pad)
+        else:
+            other_entry.grid_remove()
+        update_preview_name()
+    base_var.trace_add("write", on_base_change)
+
+    ttk.Label(body, text="Friendly name:").grid(row=base_row + 3, column=0, sticky="w", **pad)
+    friendly_var = tk.StringVar()
+    ttk.Entry(body, textvariable=friendly_var, width=42).grid(
+        row=base_row + 3, column=1, sticky="we", **pad)
+    friendly_var.trace_add("write", lambda *_: update_preview_name())
+
+    ttk.Label(body, text="Keywords (comma):").grid(row=base_row + 4, column=0, sticky="w", **pad)
+    kw_var = tk.StringVar()
+    ttk.Entry(body, textvariable=kw_var, width=42).grid(
+        row=base_row + 4, column=1, sticky="we", **pad)
+
+    ttk.Label(body, text="Preview (URL/file):").grid(row=base_row + 5, column=0, sticky="w", **pad)
+    prev_var = tk.StringVar()
+    ttk.Entry(body, textvariable=prev_var, width=32).grid(
+        row=base_row + 5, column=1, sticky="we", **pad)
+
+    def browse_preview():
+        f = filedialog.askopenfilename(
+            title="Select preview image", initialdir=SCRIPT_DIR,
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp"), ("All", "*.*")])
+        if f:
+            prev_var.set(f)
+    ttk.Button(body, text="Browse", command=browse_preview).grid(
+        row=base_row + 5, column=2, sticky="w", padx=(0, 8))
+
+    ttk.Label(body, text="Result filename:").grid(row=base_row + 6, column=0, sticky="w", **pad)
+    preview_name_var = tk.StringVar(value="")
+    ttk.Label(body, textvariable=preview_name_var, foreground="#0a6",
+              wraplength=420, justify="left").grid(
+        row=base_row + 6, column=1, columnspan=2, sticky="w", **pad)
+
+    def current_tag():
+        bm = other_var.get().strip() if base_var.get() == OTHER else base_var.get()
+        return tag_for_base_model(bm) if bm else "[?]"
+
+    def update_preview_name(*_):
+        friendly = friendly_var.get().strip()
+        if not friendly:
+            preview_name_var.set("(enter a friendly name)")
+            return
+        preview_name_var.set(build_new_stem(current_tag(), friendly, friendly)
+                             + ".safetensors")
+
+    def load_selected(*_):
+        if mode != "repair":
+            return
+        sel = results_list.curselection()
+        if not sel:
+            return
+        stem = results_list.get(sel[0])
+        path = find_model_file(stem, folder_for_type())
+        if not path:
+            return
+        selected_path["path"] = path
+        st = asset_status(path)
+        status_var.set(
+            f"File: {os.path.basename(path)}\n"
+            f"Sidecar: {'yes' if st['has_sidecar'] else 'NO'}   "
+            f"Preview: {'yes' if st['has_preview'] else 'NO'}   "
+            f"Base: {st['base_model'] or 'unknown'}")
+        if st["base_model"] and st["base_model"] in base_choices:
+            base_var.set(st["base_model"])
+        if st["model_name"]:
+            friendly_var.set(st["model_name"])
+        elif not friendly_var.get():
+            friendly_var.set(decamel(stem))
+        if st["keywords"]:
+            kw_var.set(", ".join(st["keywords"]))
+        update_preview_name()
+    if mode == "repair":
+        results_list.bind("<<ListboxSelect>>", load_selected)
+
+    def pull_from_url():
+        u = url_var.get().strip()
+        if not u:
+            messagebox.showinfo("No URL", "Paste a Civitai URL first.")
+            return
+        meta = fetch_metadata_by_url(u, api_key)
+        if not meta:
+            messagebox.showwarning("Pull failed",
+                                   "Couldn't fetch metadata from that URL.")
+            return
+        if meta.get("base_model") and meta["base_model"] in base_choices:
+            base_var.set(meta["base_model"])
+        elif meta.get("base_model"):
+            base_var.set(OTHER)
+            other_var.set(meta["base_model"])
+        if meta.get("model_name"):
+            friendly_var.set(meta["model_name"])
+        if meta.get("keywords"):
+            kw_var.set(", ".join(meta["keywords"]))
+        if meta.get("preview_url") and not prev_var.get().strip():
+            prev_var.set(meta["preview_url"])
+        update_preview_name()
+    ttk.Button(body, text="Pull from URL", command=pull_from_url).grid(
+        row=base_row, column=2, sticky="w", padx=(0, 8))
+
+    body.columnconfigure(1, weight=1)
+
+    action = ttk.Frame(win, padding=8)
+    action.pack(fill="x", side="bottom")
+
+    def do_apply():
+        if mode == "repair":
+            path = selected_path["path"]
+            if not path:
+                messagebox.showwarning("No asset", "Select an asset to repair.")
+                return
+        else:
+            path = None
+            guess = friendly_var.get().strip()
+            if guess:
+                path = find_model_file(guess, folder_for_type())
+            if not path:
+                f = filedialog.askopenfilename(
+                    title="Select the model file to add",
+                    initialdir=folder_for_type() or SCRIPT_DIR,
+                    filetypes=[("Models", "*.safetensors *.ckpt *.pt"),
+                               ("All", "*.*")])
+                if not f:
+                    return
+                path = f
+        bm = other_var.get().strip() if base_var.get() == OTHER else base_var.get()
+        if not bm:
+            messagebox.showwarning("No base model", "Choose or type a base model.")
+            return
+        friendly = friendly_var.get().strip()
+        if not friendly:
+            messagebox.showwarning("No name", "Enter a friendly name.")
+            return
+        keywords = [k.strip() for k in kw_var.get().split(",") if k.strip()]
+        tag = tag_for_base_model(bm)
+        ok, msg = apply_manual_asset(
+            path, tag, friendly, keywords, prev_var.get().strip(),
+            api_key=api_key, make_exclusion=(mode == "add"), log=log)
+        log(f"[{mode}] {msg}")
+        messagebox.showinfo("Done" if ok else "Failed", msg)
+        if ok:
+            win.destroy()
+
+    apply_text = "Attempt Repair" if mode == "repair" else "Attempt Add"
+    cancel_text = "Cancel Repair" if mode == "repair" else "Cancel Add"
+    ttk.Button(action, text=apply_text, command=do_apply).pack(side="left", padx=4)
+    ttk.Button(action, text=cancel_text, command=win.destroy).pack(side="left", padx=4)
+
+    on_base_change()
+    update_preview_name()
+
+
+def launch_gui():
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    ensure_working_files()
+    cfg = load_config()
+    cancel_flag = threading.Event()
+
+    root = tk.Tk()
+    root.title("Re:Tentative-Stable Diffusion Model Manager [Beta]")
+    root.geometry("820x600")
+    root.resizable(False, False)
+
+    # --- top row: API key, Save, Configuration, Help ---
+    key_frame = ttk.Frame(root, padding=8)
+    key_frame.pack(fill="x")
+    ttk.Label(key_frame, text="Civitai API Key:").pack(side="left")
+    key_var = tk.StringVar(value=cfg.get("api_key", ""))
+    ttk.Entry(key_frame, textvariable=key_var, show="*", width=40).pack(side="left", padx=6)
+
+    def save_key():
+        cfg["api_key"] = key_var.get().strip()
+        save_config(cfg)
+        messagebox.showinfo("Saved", "API key saved.")
+    ttk.Button(key_frame, text="Save Key", command=save_key).pack(side="left")
+    ttk.Button(key_frame, text="Configuration",
+               command=lambda: open_config_dialog(root, cfg)).pack(side="left", padx=4)
+    # Help (?) sits in the upper-right corner
+    ttk.Button(key_frame, text="?", width=3,
+               command=lambda: open_help_dialog(root)).pack(side="right")
+
+    # --- download queue ---
+    list_frame = ttk.LabelFrame(root, text="Download Queue (Civitai .com / .red)",
+                                padding=8)
+    list_frame.pack(fill="both", expand=False, padx=8, pady=4)
+    listbox = tk.Listbox(list_frame, height=8)
+    listbox.pack(fill="both", expand=True, side="left")
+    sb = ttk.Scrollbar(list_frame, command=listbox.yview)
+    sb.pack(side="right", fill="y")
+    listbox.config(yscrollcommand=sb.set)
+
+    btn_frame = ttk.Frame(root, padding=8)
+    btn_frame.pack(fill="x")
+
+    def add_from_clipboard():
+        try:
+            clip = root.clipboard_get().strip()
+        except tk.TclError:
+            messagebox.showwarning("Clipboard empty", "Nothing in clipboard.")
+            return
+        if "civitai." not in clip:
+            messagebox.showwarning(
+                "Not a Civitai URL",
+                f"Clipboard doesn't look like a Civitai URL:\n{clip}")
+            return
+        listbox.insert("end", clip)
+
+    def add_batch():
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select a .txt of Civitai URLs (one per line)",
+            initialdir=os.getcwd(),
+            filetypes=[("Text files", "*.txt"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception as e:
+            messagebox.showerror("Read failed", str(e))
+            return
+        existing = set(listbox.get(0, "end"))
+        added = skipped = dupes = 0
+        for raw in lines:
+            u = raw.strip()
+            if not u:
+                continue
+            if "civitai." not in u:
+                skipped += 1
+                continue
+            if u in existing:
+                dupes += 1
+                continue
+            listbox.insert("end", u)
+            existing.add(u)
+            added += 1
+        log(f"Batch load: added {added}, skipped {skipped} non-Civitai, "
+            f"{dupes} duplicate(s).")
+
+    def remove_selected():
+        for i in reversed(listbox.curselection()):
+            listbox.delete(i)
+
+    # --- log ---
+    log_frame = ttk.LabelFrame(root, text="Log", padding=8)
+    log_frame.pack(fill="both", expand=True, padx=8, pady=4)
+    log_text = tk.Text(log_frame, height=12, wrap="word")
+    log_text.pack(fill="both", expand=True)
+
+    def log(msg):
+        log_text.insert("end", str(msg) + "\n")
+        log_text.see("end")
+        root.update_idletasks()
+
+    def in_thread(fn):
+        threading.Thread(target=fn, daemon=True).start()
+
+    def require_paths():
+        if not paths_configured(cfg):
+            messagebox.showinfo(
+                "Configuration needed",
+                "Set your Checkpoints, LoRA, and VAE folders in Configuration first.")
+            open_config_dialog(root, cfg)
+            return False
+        return True
+
+    def begin_download():
+        if not require_paths():
+            return
+        cancel_flag.clear()
+        urls = list(listbox.get(0, "end"))
+        if not urls:
+            messagebox.showinfo("Empty", "Queue is empty.")
+            return
+        api_key = key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning("No API key",
+                                   "Enter and save your Civitai API key first.")
+            return
+        cfg["api_key"] = api_key
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+        def work():
+            log(f"Starting {len(urls)} download(s)...")
+            for url in urls:
+                if cancel_flag.is_set():
+                    log("Cancelled by user.")
+                    return
+                kind, cid = civitai_version_id_from_url(url)
+                if not cid:
+                    log(f"  ! could not parse id from: {url}")
+                    continue
+                try:
+                    dl_url, fname = resolve_download_url(kind, cid, api_key)
+                except Exception as e:
+                    log(f"  ! resolve failed for {url}: {e}")
+                    continue
+                if not dl_url:
+                    log(f"  ! no downloadable file for {url}")
+                    continue
+                dest = os.path.join(DOWNLOAD_DIR, fname or f"{cid}.safetensors")
+                log(f"  downloading {fname} ...")
+                try:
+                    ok = http_download(dl_url, dest, api_key=api_key,
+                                       cancel_flag=cancel_flag)
+                    log("    done." if ok else "    cancelled.")
+                except Exception as e:
+                    log(f"    ! download error: {e}")
+            if cancel_flag.is_set():
+                return
+            log("\nSorting downloads into model folders...")
+            sort_downloads(cfg, log=log, cancel_flag=cancel_flag)
+            log("\nLabel & Skin pass on new files...")
+            label_and_skin(cfg, log=log, cancel_flag=cancel_flag)
+            log("\nAll done.")
+        in_thread(work)
+
+    def label_skin_only():
+        if not require_paths():
+            return
+        cancel_flag.clear()
+        cfg["api_key"] = key_var.get().strip()
+        if not cfg["api_key"]:
+            if not messagebox.askyesno(
+                "No API key",
+                "No API key set. LoRAs with sidecars still process, but "
+                "checkpoints (no sidecar) can't be classified and will be "
+                "quarantined. Continue anyway?"):
+                return
+        in_thread(lambda: label_and_skin(cfg, log=log, cancel_flag=cancel_flag))
+
+    def sort_only():
+        if not require_paths():
+            return
+        cancel_flag.clear()
+        in_thread(lambda: sort_downloads(cfg, log=log, cancel_flag=cancel_flag))
+
+    def cancel_all():
+        cancel_flag.set()
+        log("Cancel requested -- finishing current file then stopping.")
+
+    # LEFT cluster (4)
+    add_mb = ttk.Menubutton(btn_frame, text="Add \u25be", direction="below")
+    add_menu = tk.Menu(add_mb, tearoff=False)
+    add_menu.add_command(label="Add Clipboard", command=add_from_clipboard)
+    add_menu.add_command(label="Add Batch (.txt of URLs)...", command=add_batch)
+    add_mb["menu"] = add_menu
+    add_mb.pack(side="left", padx=3)
+    ttk.Button(btn_frame, text="Remove", command=remove_selected).pack(side="left", padx=3)
+    ttk.Button(btn_frame, text="Begin Download", command=begin_download).pack(side="left", padx=3)
+    ttk.Button(btn_frame, text="Cancel", command=cancel_all).pack(side="left", padx=3)
+
+    # RIGHT cluster (4, packed right-to-left => Label & Skin | Sort Only | Repair | Add)
+    ttk.Button(btn_frame, text="Add Asset",
+               command=lambda: open_asset_form(root, "add", cfg, log)).pack(side="right", padx=3)
+    ttk.Button(btn_frame, text="Repair Asset",
+               command=lambda: open_asset_form(root, "repair", cfg, log)).pack(side="right", padx=3)
+    ttk.Button(btn_frame, text="Sort Only", command=sort_only).pack(side="right", padx=3)
+    ttk.Button(btn_frame, text="Label & Skin", command=label_skin_only).pack(side="right", padx=3)
+
+    log("Re:Tentative ready.")
+    log(f"Working folder: {SCRIPT_DIR}")
+    log("Click ? for the README. First time: set folders in Configuration, "
+        "then Save your Civitai API key.")
+
+    # --- first-run onboarding: Configuration, then API key prompt ---
+    def first_run_flow():
+        if not paths_configured(cfg):
+            messagebox.showinfo(
+                "Welcome to Re:Tentative",
+                "First, tell the tool where your model folders are.")
+            open_config_dialog(root, cfg, on_saved=prompt_api_key)
+        elif not cfg.get("api_key"):
+            prompt_api_key()
+
+    def prompt_api_key():
+        if cfg.get("api_key"):
+            return
+        from tkinter import simpledialog
+        key = simpledialog.askstring(
+            "Civitai API Key",
+            "Paste your Civitai API key (leave blank to skip for now):",
+            parent=root, show="*")
+        if key:
+            cfg["api_key"] = key.strip()
+            key_var.set(cfg["api_key"])
+            save_config(cfg)
+
+    root.after(300, first_run_flow)
+    root.mainloop()
+
+
+def main():
+    ensure_working_files()
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1].lower()
+        cfg = load_config()
+        if cmd == "labelskin":
+            label_and_skin(cfg)
+        elif cmd == "sort":
+            sort_downloads(cfg)
+        elif cmd == "gui":
+            launch_gui()
+        else:
+            print("Usage: retentative.py [gui|labelskin|sort]")
+    else:
+        launch_gui()
+
+
+if __name__ == "__main__":
+    main()

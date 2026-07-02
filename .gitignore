@@ -1,0 +1,18 @@
+# Internal / development material, not for release
+ToIgnore/
+
+# Claude-facing handoff and config files
+.claude/
+CLAUDE.md
+*_FOR_CLAUDE_CODE.md
+
+# Re:Tentative runtime files (generated next to the script; may hold your API key)
+sd_mm_config.json
+_exclusion_list.txt
+_unresolved.txt
+_skip_cache.json
+Downloaded Content/
+
+# Python
+__pycache__/
+*.py[cod]
