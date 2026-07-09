@@ -16,19 +16,25 @@ FIRST RUN
   It also creates, next to this script, empty working files:
       _exclusion_list.txt   _unresolved.txt   _skip_cache.json
       sd_mm_config.json     Downloaded Content/   (empty folder)
+  (_saved_queue.txt is created on first Save Queue, not at first run.)
 
 WHAT THE BUTTONS DO   (see the ? Help button in-app for the full README)
-  Add            menu: Add Clipboard / Add Batch (a .txt of URLs)
+  Add Batch      load a .txt of Civitai URLs (one per line) into the queue
+  + / Ctrl+V     add one clipboard URL (corner + button, or Ctrl+V in queue)
   Remove         drop the selected queue item
-  Begin Download fetch the queue, sort, then label + skin the new files
+  Clear Queue    empty the queue (confirms only while a download is running)
+  Begin Download fetch the queue (live progress bar), sort, then label + skin
   Cancel         stop after the current file
   Label & Skin   walk your library: classify, rename, grab missing previews
   Sort Only      route loose files from Downloaded Content into model folders
   Repair Asset   fix one asset by hand (search, edit fields, re-skin)
   Add Asset      register a non-Civitai file (HuggingFace/TensorHub); it is
                  labeled/skinned AND added to the exclusion list
+  Save Queue     save the queue to _saved_queue.txt (auto-reloads next launch)
+  Export Queue   save the queue to a .txt you pick (loads back via Add Batch)
   Configuration  set your model folder paths
   Save Key       store your Civitai API key
+  Exit           close the program
   ?              open the in-app README
 
 CLASSIFICATION (per file, in order)
@@ -70,7 +76,21 @@ CONFIG_PATH     = os.path.join(SCRIPT_DIR, "sd_mm_config.json")
 EXCLUSION_PATH  = os.path.join(SCRIPT_DIR, "_exclusion_list.txt")
 UNRESOLVED_PATH = os.path.join(SCRIPT_DIR, "_unresolved.txt")
 SKIPCACHE_PATH  = os.path.join(SCRIPT_DIR, "_skip_cache.json")
+SAVED_QUEUE_PATH = os.path.join(SCRIPT_DIR, "_saved_queue.txt")
 DOWNLOAD_DIR    = os.path.join(SCRIPT_DIR, "Downloaded Content")
+
+
+def set_console_title(title="Re:Tentative Worker"):
+    """Give the console window a recognizable name so it isn't mistaken for
+    junk and closed (closing it kills the app). Windows-only; a harmless
+    no-op elsewhere. NOTE: the truly console-free launch is renaming this
+    file to .pyw (runs under pythonw.exe, no console at all) -- see README.
+    """
+    try:
+        if os.name == "nt":
+            os.system(f"title {title}")
+    except Exception:
+        pass
 
 # ----------------------------------------------------------------------------
 # CIVITAI ENDPOINTS
@@ -124,6 +144,28 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+
+
+def save_queue_to_disk(urls):
+    """Persist the current queue so it survives closing the app (auto-reload)."""
+    try:
+        with open(SAVED_QUEUE_PATH, "w", encoding="utf-8") as f:
+            for u in urls:
+                f.write(u + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def load_saved_queue():
+    """Read the auto-reload queue file, if present. Returns a list of URLs."""
+    if not os.path.isfile(SAVED_QUEUE_PATH):
+        return []
+    try:
+        with open(SAVED_QUEUE_PATH, "r", encoding="utf-8") as f:
+            return [ln.strip() for ln in f if ln.strip()]
+    except Exception:
+        return []
 
 
 def paths_configured(cfg):
@@ -250,8 +292,16 @@ def http_download(url, dest_path, api_key=None, timeout=120, cancel_flag=None,
                     break
                 out.write(chunk)
                 done += len(chunk)
-                if progress and total:
-                    progress(done / total)
+                if progress:
+                    if total:
+                        progress(done / total)
+                    else:
+                        # No Content-Length: no fraction to report. Signal the
+                        # unknown-total case with a negative sentinel carrying
+                        # bytes-done, so a caller can show a byte counter
+                        # instead of a percent. Callers that only understand
+                        # fractions simply clamp it to 0%.
+                        progress(-(done + 1))
         os.replace(tmp, dest_path)
     return True
 
@@ -366,12 +416,67 @@ def scrape_data_next_head(model_id, api_key=None):
     return None
 
 
-def pick_preview_url(images):
-    for img in images:
-        u = img.get("url")
-        if u:
-            return u
+# Video previews are common on Civitai (roughly a third of entries). Prefer a
+# real image and fall through the list: the still a user wants is usually the
+# very next preview after a video. As a last resort, try to pull a still frame
+# from a video URL. Every candidate is content-validated on download, so a
+# video or an error page is never saved as a preview.
+_VIDEO_EXTS = {".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv", ".gifv"}
+
+_IMAGE_MAGIC = (
+    b"\x89PNG\r\n\x1a\n",   # png
+    b"\xff\xd8\xff",         # jpeg
+    b"GIF87a", b"GIF89a",    # gif
+    b"BM",                    # bmp
+)
+
+
+def _looks_like_image(head):
+    """True if the leading bytes are a known image signature (WEBP is RIFF....WEBP)."""
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return True
+    return any(head.startswith(sig) for sig in _IMAGE_MAGIC)
+
+
+def _video_to_poster(url):
+    """Best-effort still-frame URL for a Civitai video: swap the trailing video
+    extension for .jpeg. Civitai's CDN often returns a poster frame for that.
+    A wrong guess is discarded by the content check on download."""
+    base, ext = os.path.splitext(url)
+    if ext.lower() in _VIDEO_EXTS:
+        return base + ".jpeg"
     return None
+
+
+def image_preview_candidates(images):
+    """Ordered preview URLs to try: real images first (in list order), then
+    still-frame attempts derived from any videos. Entries are judged by their
+    'type' field and their URL extension."""
+    if not images:
+        return []
+    image_urls, video_urls = [], []
+    for img in images:
+        url = img.get("url")
+        if not url:
+            continue
+        itype = (img.get("type") or "").lower()
+        ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+        if itype == "video" or ext in _VIDEO_EXTS:
+            video_urls.append(url)
+        else:
+            image_urls.append(url)
+    candidates = list(image_urls)
+    for v in video_urls:
+        poster = _video_to_poster(v)
+        if poster:
+            candidates.append(poster)
+    return candidates
+
+
+def pick_preview_url(images):
+    """First usable image preview URL (video entries skipped), or None."""
+    cands = image_preview_candidates(images)
+    return cands[0] if cands else None
 
 
 def resolve_model(model_path, api_key, cancel_flag=None):
@@ -383,6 +488,7 @@ def resolve_model(model_path, api_key, cancel_flag=None):
             "tag": tag_for_base_model(base),
             "model_name": name,
             "preview_url": pick_preview_url(images),
+            "images": images,
             "source": "sidecar",
         }
     tried.append("sidecar(absent)")
@@ -399,6 +505,7 @@ def resolve_model(model_path, api_key, cancel_flag=None):
             "tag": tag_for_base_model(hit["base_model"]),
             "model_name": hit.get("model_name"),
             "preview_url": pick_preview_url(hit.get("images") or []),
+            "images": hit.get("images") or [],
             "source": "hash",
         }
 
@@ -411,6 +518,7 @@ def resolve_model(model_path, api_key, cancel_flag=None):
                 "tag": tag_for_base_model(scraped),
                 "model_name": hit.get("model_name"),
                 "preview_url": pick_preview_url(hit.get("images") or []),
+                "images": hit.get("images") or [],
                 "source": "scrape",
             }
         tried.append("scrape(failed)")
@@ -431,6 +539,15 @@ def resolve_model(model_path, api_key, cancel_flag=None):
 def build_new_stem(tag, model_name, original_stem):
     friendly = model_name.strip() if model_name else decamel(original_stem)
     friendly = sanitize_filename(friendly)
+    # Idempotency guard against the double-dip bug: if the friendly text already
+    # begins with a [BaseModel] tag (from an earlier naming pass, or an already-
+    # formatted filename fed back through decamel), strip it before composing so
+    # we never produce "[Tag]-[Tag] Name". Handles a leading "[X] " or "[X]-"
+    # and repeats to collapse any accidental multi-prefix.
+    prev = None
+    while prev != friendly:
+        prev = friendly
+        friendly = re.sub(r"^\[[^\[\]]*\]\s*-?\s*", "", friendly, count=1).strip()
     MAX_FRIENDLY = 80   # keep full path under Windows MAX_PATH (~260)
     if len(friendly) > MAX_FRIENDLY:
         friendly = friendly[:MAX_FRIENDLY].rstrip()
@@ -473,15 +590,57 @@ def has_preview(model_path):
     return False
 
 
-def grab_preview(model_path, preview_url, api_key, cancel_flag=None):
-    if not preview_url or has_preview(model_path):
+def _download_validated_image(url, dest, api_key=None, cancel_flag=None):
+    """Download url to a temp file and keep it only if the bytes are actually an
+    image. Returns True on success. A video, HTML error page, or empty body is
+    rejected and removed, never saved as the preview."""
+    tmp = dest + ".dl"
+    try:
+        ok = http_download(url, tmp, api_key=api_key, cancel_flag=cancel_flag)
+    except Exception:
+        ok = False
+    if not ok:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    try:
+        with open(tmp, "rb") as f:
+            head = f.read(32)
+    except Exception:
+        head = b""
+    if not _looks_like_image(head):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    try:
+        os.replace(tmp, dest)
+        return True
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def grab_preview(model_path, images, api_key, cancel_flag=None):
+    """Save <stem>.preview.png from the first candidate that downloads AND is a
+    real image. Tries every image in the list, then still-frame attempts from
+    videos, before giving up. Skips if a preview already exists."""
+    if has_preview(model_path):
         return False
     dest = os.path.splitext(model_path)[0] + ".preview.png"
-    try:
-        return http_download(preview_url, dest, api_key=api_key,
-                             cancel_flag=cancel_flag)
-    except Exception:
-        return False
+    for url in image_preview_candidates(images):
+        if cancel_flag is not None and cancel_flag.is_set():
+            return False
+        if _download_validated_image(url, dest, api_key=api_key,
+                                     cancel_flag=cancel_flag):
+            return True
+    return False
 
 
 # ============================================================================
@@ -546,7 +705,7 @@ def label_and_skin(cfg, log=print, cancel_flag=None):
                 continue
 
             new_stem = build_new_stem(info["tag"], info["model_name"], stem)
-            if grab_preview(model_path, info["preview_url"], api_key,
+            if grab_preview(model_path, info["images"], api_key,
                             cancel_flag=cancel_flag):
                 counts["previewed"] += 1
                 log(f"  preview grabbed: {fname}")
@@ -845,11 +1004,17 @@ FIRST-TIME SETUP
   downloads land there before being sorted.
 
 THE BUTTONS
-  Add (menu)     Add Clipboard adds a Civitai URL from your clipboard to the
-                 queue. Add Batch loads a .txt file of URLs (one per line).
+  Add Batch      Load a .txt file of Civitai URLs (one per line) into the queue.
+  + / Ctrl+V     Add a single Civitai URL from your clipboard to the queue.
+                 Click the small + on the queue's top-right corner, or press
+                 Ctrl+V with the queue focused.
   Remove         Remove the selected queue entry.
+  Clear Queue    Empty the whole queue. Asks first only if a download is
+                 running; otherwise clears immediately.
   Begin Download Download everything in the queue into Downloaded Content,
-                 then sort and label/skin the new files automatically.
+                 then sort and label/skin the new files automatically. Each
+                 file shows a live progress bar that collapses to one record
+                 line when it finishes.
   Cancel         Stop after the current file finishes.
   Label & Skin   Walk your whole library: classify each model, rename it to
                  [BaseModel]-Friendly Name, and grab a preview if missing.
@@ -859,10 +1024,15 @@ THE BUTTONS
   Repair Asset   Fix one asset by hand. Search your library, pick a file, and
                  correct its base model, name, keywords, or preview.
   Add Asset      Register a file that did NOT come from Civitai (HuggingFace,
-                 TensorHub, a local merge). It gets labeled and skinned, and
-                 added to the exclusion list so the auto-pass leaves it alone.
+                 TensorHub, a local merge). Pick it with Load From Local; it is
+                 labeled and skinned, and added to the exclusion list so the
+                 auto-pass leaves it alone.
+  Save Queue     Save the current queue so it reloads automatically next launch.
+  Export Queue   Save the queue to a .txt file you choose (shareable; loads
+                 back in via Add Batch).
   Configuration  Set the three model folder paths.
   Save Key       Store your Civitai API key.
+  Exit           Close the program.
 
 HOW CLASSIFICATION WORKS
   For each file the tool tries, in order:
@@ -874,6 +1044,13 @@ HOW CLASSIFICATION WORKS
        and logged to _unresolved.txt. The tool never guesses a base model
        from a filename, so it will never write a wrong label silently.
 
+PREVIEWS
+  When a model has no preview, one is fetched from its Civitai images. Many
+  Civitai previews are videos, so the tool prefers a real still: it skips
+  videos and falls through to the next image, and validates that what it saves
+  is actually an image. If no usable still exists, the model is left without a
+  preview rather than with a broken one.
+
 FILES THE TOOL KEEPS  (all next to this program)
   _exclusion_list.txt  Filename stems to skip entirely. Put non-Civitai files
                        here so they aren't re-checked every run.
@@ -881,6 +1058,8 @@ FILES THE TOOL KEEPS  (all next to this program)
                        resolved -- your punch list for manual Repair.
   _skip_cache.json     Remembers files that failed once, so big files aren't
                        re-hashed every run. Delete it to force a full retry.
+  _saved_queue.txt     Your saved download queue. Written by Save Queue and
+                       reloaded automatically on the next launch.
   sd_mm_config.json    Your API key and folder paths.
 
 A NOTE ABOUT RENAMING
@@ -1017,6 +1196,35 @@ def open_asset_form(parent, mode, cfg, log):
         type_var.trace_add("write", refresh_results)
         refresh_results()
 
+    # Add mode: pick the local .safetensors up front so the file is chosen
+    # deliberately, not sprung as an Open dialog at commit time. This row sits
+    # where Repair's search list would be. Selecting a file fills the friendly
+    # name from its stem as a starting point.
+    add_file_var = tk.StringVar()
+    if mode == "add":
+        ttk.Label(body, text="Model file:").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Entry(body, textvariable=add_file_var, width=42, state="readonly").grid(
+            row=0, column=1, sticky="we", **pad)
+
+        def browse_model():
+            downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+            init_dir = downloads if os.path.isdir(downloads) else (
+                folder_for_type() or SCRIPT_DIR)
+            f = filedialog.askopenfilename(
+                title="Load model file from local disk",
+                initialdir=init_dir,
+                filetypes=[("Models", "*.safetensors *.ckpt *.pt"),
+                           ("All", "*.*")])
+            if not f:
+                return
+            selected_path["path"] = f
+            add_file_var.set(os.path.basename(f))
+            if not friendly_var.get().strip():
+                friendly_var.set(decamel(os.path.splitext(os.path.basename(f))[0]))
+            update_preview_name()
+        ttk.Button(body, text="Load From Local", command=browse_model).grid(
+            row=0, column=2, sticky="w", padx=(0, 8))
+
     status_var = tk.StringVar(value="")
     if mode == "repair":
         ttk.Label(body, textvariable=status_var, foreground="#555",
@@ -1025,10 +1233,15 @@ def open_asset_form(parent, mode, cfg, log):
 
     base_row = 3 if mode == "repair" else 0
 
-    ttk.Label(body, text="Civitai URL:").grid(row=base_row, column=0, sticky="w", **pad)
+    # Civitai URL + Pull-from-URL only make sense in Repair, where the asset
+    # is a Civitai file whose metadata we can re-fetch. Add operates on a file
+    # that came from somewhere else (HuggingFace/TensorHub/local merge) and is
+    # already on disk -- there is nothing to pull -- so both are hidden in Add.
     url_var = tk.StringVar()
-    ttk.Entry(body, textvariable=url_var, width=42).grid(
-        row=base_row, column=1, sticky="we", **pad)
+    if mode == "repair":
+        ttk.Label(body, text="Civitai URL:").grid(row=base_row, column=0, sticky="w", **pad)
+        ttk.Entry(body, textvariable=url_var, width=42).grid(
+            row=base_row, column=1, sticky="we", **pad)
 
     ttk.Label(body, text="Base model:").grid(row=base_row + 1, column=0, sticky="w", **pad)
     base_choices = scan_known_base_models(cfg) + [OTHER]
@@ -1060,14 +1273,25 @@ def open_asset_form(parent, mode, cfg, log):
     ttk.Entry(body, textvariable=kw_var, width=42).grid(
         row=base_row + 4, column=1, sticky="we", **pad)
 
-    ttk.Label(body, text="Preview (URL/file):").grid(row=base_row + 5, column=0, sticky="w", **pad)
+    prev_label = "Preview image (file):" if mode == "add" else "Preview (URL/file):"
+    ttk.Label(body, text=prev_label).grid(row=base_row + 5, column=0, sticky="w", **pad)
     prev_var = tk.StringVar()
     ttk.Entry(body, textvariable=prev_var, width=32).grid(
         row=base_row + 5, column=1, sticky="we", **pad)
 
     def browse_preview():
+        # Add works on a file already on disk, so default the image picker to
+        # that file's own folder, not the script dir -- the preview usually
+        # sits right next to the model it belongs to.
+        init_dir = SCRIPT_DIR
+        if mode == "add":
+            existing = selected_path.get("path")
+            if existing:
+                init_dir = os.path.dirname(existing)
+            elif os.path.isdir(folder_for_type()):
+                init_dir = folder_for_type()
         f = filedialog.askopenfilename(
-            title="Select preview image", initialdir=SCRIPT_DIR,
+            title="Select preview image", initialdir=init_dir,
             filetypes=[("Images", "*.png *.jpg *.jpeg *.webp"), ("All", "*.*")])
         if f:
             prev_var.set(f)
@@ -1143,8 +1367,9 @@ def open_asset_form(parent, mode, cfg, log):
         if meta.get("preview_url") and not prev_var.get().strip():
             prev_var.set(meta["preview_url"])
         update_preview_name()
-    ttk.Button(body, text="Pull from URL", command=pull_from_url).grid(
-        row=base_row, column=2, sticky="w", padx=(0, 8))
+    if mode == "repair":
+        ttk.Button(body, text="Pull from URL", command=pull_from_url).grid(
+            row=base_row, column=2, sticky="w", padx=(0, 8))
 
     body.columnconfigure(1, weight=1)
 
@@ -1158,19 +1383,14 @@ def open_asset_form(parent, mode, cfg, log):
                 messagebox.showwarning("No asset", "Select an asset to repair.")
                 return
         else:
-            path = None
-            guess = friendly_var.get().strip()
-            if guess:
-                path = find_model_file(guess, folder_for_type())
+            # Add: the file was chosen up front via Load From Local. No guessing,
+            # no commit-time picker. If nothing's loaded, say so plainly.
+            path = selected_path["path"]
             if not path:
-                f = filedialog.askopenfilename(
-                    title="Select the model file to add",
-                    initialdir=folder_for_type() or SCRIPT_DIR,
-                    filetypes=[("Models", "*.safetensors *.ckpt *.pt"),
-                               ("All", "*.*")])
-                if not f:
-                    return
-                path = f
+                messagebox.showwarning(
+                    "No file loaded",
+                    "Click Load From Local and choose the model file to add.")
+                return
         bm = other_var.get().strip() if base_var.get() == OTHER else base_var.get()
         if not bm:
             messagebox.showwarning("No base model", "Choose or type a base model.")
@@ -1208,26 +1428,42 @@ def launch_gui():
 
     root = tk.Tk()
     root.title("Re:Tentative-Stable Diffusion Model Manager [Beta]")
-    root.geometry("820x600")
+    root.geometry("840x600")
     root.resizable(False, False)
 
-    # --- top row: API key, Save, Configuration, Help ---
+    # Live-download flag: Clear Queue confirms only while a run is active.
+    download_active = threading.Event()
+
+    # --- top row: queue-file actions (left), API key + Save Key + ? (right) ---
     key_frame = ttk.Frame(root, padding=8)
     key_frame.pack(fill="x")
-    ttk.Label(key_frame, text="Civitai API Key:").pack(side="left")
     key_var = tk.StringVar(value=cfg.get("api_key", ""))
-    ttk.Entry(key_frame, textvariable=key_var, show="*", width=40).pack(side="left", padx=6)
 
     def save_key():
         cfg["api_key"] = key_var.get().strip()
         save_config(cfg)
         messagebox.showinfo("Saved", "API key saved.")
-    ttk.Button(key_frame, text="Save Key", command=save_key).pack(side="left")
+
+    # LEFT group (cols 2-5): queue-file actions + Exit + Configuration.
+    ttk.Button(key_frame, text="Save Queue",
+               command=lambda: save_queue()).grid(row=0, column=2, padx=3)
+    ttk.Button(key_frame, text="Export Queue",
+               command=lambda: export_queue()).grid(row=0, column=3, padx=3)
+    ttk.Button(key_frame, text="Exit",
+               command=lambda: root.destroy()).grid(row=0, column=4, padx=3)
     ttk.Button(key_frame, text="Configuration",
-               command=lambda: open_config_dialog(root, cfg)).pack(side="left", padx=4)
-    # Help (?) sits in the upper-right corner
+               command=lambda: open_config_dialog(root, cfg)).grid(row=0, column=5, padx=3)
+
+    key_frame.columnconfigure(6, weight=1)   # spacer eats the slack
+
+    # RIGHT group (cols 7-10): API Key label + field, then Save Key, then ?.
+    ttk.Label(key_frame, text="Civitai API Key:").grid(row=0, column=7, sticky="e", padx=(0, 4))
+    ttk.Entry(key_frame, textvariable=key_var, show="*", width=32).grid(
+        row=0, column=8, padx=(0, 6))
+    ttk.Button(key_frame, text="Save Key",
+               command=save_key).grid(row=0, column=9, padx=3)
     ttk.Button(key_frame, text="?", width=3,
-               command=lambda: open_help_dialog(root)).pack(side="right")
+               command=lambda: open_help_dialog(root)).grid(row=0, column=10, padx=(3, 0))
 
     # --- download queue ---
     list_frame = ttk.LabelFrame(root, text="Download Queue (Civitai .com / .red)",
@@ -1242,18 +1478,39 @@ def launch_gui():
     btn_frame = ttk.Frame(root, padding=8)
     btn_frame.pack(fill="x")
 
-    def add_from_clipboard():
+    def add_from_clipboard(silent=False):
+        """Validate the clipboard as a Civitai URL and append if new.
+        Shared by the '+' button and the Ctrl+V binding on the queue."""
         try:
             clip = root.clipboard_get().strip()
         except tk.TclError:
-            messagebox.showwarning("Clipboard empty", "Nothing in clipboard.")
+            if not silent:
+                messagebox.showwarning("Clipboard empty", "Nothing in clipboard.")
             return
         if "civitai." not in clip:
-            messagebox.showwarning(
-                "Not a Civitai URL",
-                f"Clipboard doesn't look like a Civitai URL:\n{clip}")
+            if not silent:
+                messagebox.showwarning(
+                    "Not a Civitai URL",
+                    f"Clipboard doesn't look like a Civitai URL:\n{clip}")
+            return
+        if clip in set(listbox.get(0, "end")):
+            if not silent:
+                messagebox.showinfo("Duplicate", "That URL is already in the queue.")
             return
         listbox.insert("end", clip)
+
+    # Ctrl+V on the queue area pastes-and-validates (silent: no popup on miss).
+    def _paste_into_queue(_event=None):
+        add_from_clipboard(silent=True)
+        return "break"
+    listbox.bind("<Control-v>", _paste_into_queue)
+    list_frame.bind("<Control-v>", _paste_into_queue)
+
+    # '+' on the queue frame's top-right border line, lifted up onto the border
+    # itself (y negative) so it rides above the scrollbar's up-arrow.
+    plus_btn = ttk.Button(list_frame, text="+", width=2,
+                          command=lambda: add_from_clipboard(silent=False))
+    plus_btn.place(relx=1.0, rely=0.0, x=8, y=-1, anchor="se")
 
     def add_batch():
         from tkinter import filedialog
@@ -1291,6 +1548,48 @@ def launch_gui():
         for i in reversed(listbox.curselection()):
             listbox.delete(i)
 
+    def save_queue():
+        """Silent auto-reload save to _saved_queue.txt (loaded on next launch)."""
+        urls = list(listbox.get(0, "end"))
+        if save_queue_to_disk(urls):
+            log(f"Queue saved ({len(urls)} item(s)) -- will auto-reload on next launch.")
+        else:
+            log("! Queue save failed.")
+
+    def export_queue():
+        """Write the queue to a user-chosen portable .txt (round-trips via Add Batch)."""
+        from tkinter import filedialog
+        urls = list(listbox.get(0, "end"))
+        if not urls:
+            messagebox.showinfo("Empty", "Queue is empty -- nothing to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export queue to a .txt of URLs",
+            initialdir=os.getcwd(), defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for u in urls:
+                    f.write(u + "\n")
+            log(f"Queue exported ({len(urls)} item(s)) -> {path}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+
+    def clear_queue():
+        """Empty the queue. Confirm only if a download run is active; else silent.
+        Also clears the auto-reload file so it doesn't repopulate on restart."""
+        if download_active.is_set():
+            if not messagebox.askyesno(
+                "Clear queue?",
+                "A download is currently running. Clear the queue anyway?\n"
+                "(The in-progress file finishes; remaining items are removed.)"):
+                return
+        listbox.delete(0, "end")
+        save_queue_to_disk([])   # wipe auto-reload so restart doesn't restore it
+        log("Queue cleared.")
+
     # --- log ---
     log_frame = ttk.LabelFrame(root, text="Log", padding=8)
     log_frame.pack(fill="both", expand=True, padx=8, pady=4)
@@ -1301,6 +1600,46 @@ def launch_gui():
         log_text.insert("end", str(msg) + "\n")
         log_text.see("end")
         root.update_idletasks()
+
+    def _render_bar(frac, label, width=24):
+        """Build a terminal-style bar: [#######         42%] name."""
+        frac = 0.0 if frac < 0 else (1.0 if frac > 1 else frac)
+        filled = int(round(frac * width))
+        bar = "#" * filled + " " * (width - filled)
+        return f"  [{bar} {int(frac * 100):3d}%] {label}"
+
+    def _bar_bytes(done, label):
+        """Fallback when the server sent no Content-Length: show MB pulled."""
+        return f"  [downloading... {done / (1024 * 1024):6.1f} MB] {label}"
+
+    def log_progress(text):
+        """Rewrite the LAST line of the log in place (the live progress bar).
+        Marshaled to the main thread; safe to call from the download worker.
+        The bar owns the last line during a download; log_finalize replaces it
+        with a permanent record when the file completes."""
+        def _do():
+            # 'end-1c linestart' is the start of the final line; delete to end,
+            # then write the new bar with no trailing newline so it stays put.
+            log_text.delete("end-1c linestart", "end-1c")
+            log_text.insert("end-1c", text)
+            log_text.see("end")
+        root.after(0, _do)
+
+    def log_finalize(text):
+        """Replace the live bar line with a permanent one-line record, then
+        open a fresh line so the next log() append lands cleanly."""
+        def _do():
+            log_text.delete("end-1c linestart", "end-1c")
+            log_text.insert("end-1c", text + "\n")
+            log_text.see("end")
+        root.after(0, _do)
+
+    def log_open_bar_line():
+        """Append an empty line that the bar will own and rewrite in place."""
+        def _do():
+            log_text.insert("end", "")
+            log_text.see("end")
+        root.after(0, _do)
 
     def in_thread(fn):
         threading.Thread(target=fn, daemon=True).start()
@@ -1331,38 +1670,79 @@ def launch_gui():
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         def work():
-            log(f"Starting {len(urls)} download(s)...")
-            for url in urls:
+            download_active.set()
+            try:
+                log(f"Starting {len(urls)} download(s)...")
+                for url in urls:
+                    if cancel_flag.is_set():
+                        log("Cancelled by user.")
+                        return
+                    kind, cid = civitai_version_id_from_url(url)
+                    if not cid:
+                        log(f"  ! could not parse id from: {url}")
+                        continue
+                    try:
+                        dl_url, fname = resolve_download_url(kind, cid, api_key)
+                    except Exception as e:
+                        log(f"  ! resolve failed for {url}: {e}")
+                        continue
+                    if not dl_url:
+                        log(f"  ! no downloadable file for {url}")
+                        continue
+                    dest = os.path.join(DOWNLOAD_DIR, fname or f"{cid}.safetensors")
+                    shown = fname or os.path.basename(dest)
+
+                    # Per-file progress bar. http_download calls back with the
+                    # fraction done; we throttle to integer-percent changes so
+                    # tkinter's event queue isn't flooded (the callback can fire
+                    # hundreds of times a second otherwise). The bar owns the
+                    # last log line during the download, then log_finalize
+                    # replaces it with one permanent record line.
+                    log_open_bar_line()
+                    log_progress(_render_bar(0.0, shown))
+                    _last_pct = {"v": -1}
+
+                    def _on_progress(frac, _label=shown, _state=_last_pct):
+                        # Positive: a real fraction (0..1) -> percent bar.
+                        # Negative sentinel -(bytes+1): no server total, so
+                        # show a MB counter that at least proves movement.
+                        # Both branches throttle (integer percent / whole MB)
+                        # so tkinter's event queue isn't flooded per chunk.
+                        if frac < 0:
+                            done_mb = int(((-frac) - 1) / (1024 * 1024))
+                            if done_mb != _state["v"]:
+                                _state["v"] = done_mb
+                                log_progress(_bar_bytes((-frac) - 1, _label))
+                            return
+                        pct = int(frac * 100)
+                        if pct != _state["v"]:
+                            _state["v"] = pct
+                            log_progress(_render_bar(frac, _label))
+
+                    try:
+                        ok = http_download(dl_url, dest, api_key=api_key,
+                                           cancel_flag=cancel_flag,
+                                           progress=_on_progress)
+                        if ok:
+                            try:
+                                mb = os.path.getsize(dest) / (1024 * 1024)
+                                size_str = f" ({mb:.1f} MB)"
+                            except OSError:
+                                size_str = ""
+                            log_finalize(f"  done: {shown}{size_str}")
+                        else:
+                            log_finalize(f"  cancelled: {shown}")
+                    except Exception as e:
+                        log_finalize(f"  ! download error: {shown} -- {e}")
                 if cancel_flag.is_set():
-                    log("Cancelled by user.")
                     return
-                kind, cid = civitai_version_id_from_url(url)
-                if not cid:
-                    log(f"  ! could not parse id from: {url}")
-                    continue
-                try:
-                    dl_url, fname = resolve_download_url(kind, cid, api_key)
-                except Exception as e:
-                    log(f"  ! resolve failed for {url}: {e}")
-                    continue
-                if not dl_url:
-                    log(f"  ! no downloadable file for {url}")
-                    continue
-                dest = os.path.join(DOWNLOAD_DIR, fname or f"{cid}.safetensors")
-                log(f"  downloading {fname} ...")
-                try:
-                    ok = http_download(dl_url, dest, api_key=api_key,
-                                       cancel_flag=cancel_flag)
-                    log("    done." if ok else "    cancelled.")
-                except Exception as e:
-                    log(f"    ! download error: {e}")
-            if cancel_flag.is_set():
-                return
-            log("\nSorting downloads into model folders...")
-            sort_downloads(cfg, log=log, cancel_flag=cancel_flag)
-            log("\nLabel & Skin pass on new files...")
-            label_and_skin(cfg, log=log, cancel_flag=cancel_flag)
-            log("\nAll done.")
+                log("\nSorting downloads into model folders...")
+                sort_downloads(cfg, log=log, cancel_flag=cancel_flag)
+                log("\nLabel & Skin pass on new files...")
+                label_and_skin(cfg, log=log, cancel_flag=cancel_flag)
+                log("\nAll done.")
+            finally:
+                download_active.clear()
         in_thread(work)
 
     def label_skin_only():
@@ -1389,29 +1769,36 @@ def launch_gui():
         cancel_flag.set()
         log("Cancel requested -- finishing current file then stopping.")
 
-    # LEFT cluster (4)
-    add_mb = ttk.Menubutton(btn_frame, text="Add \u25be", direction="below")
-    add_menu = tk.Menu(add_mb, tearoff=False)
-    add_menu.add_command(label="Add Clipboard", command=add_from_clipboard)
-    add_menu.add_command(label="Add Batch (.txt of URLs)...", command=add_batch)
-    add_mb["menu"] = add_menu
-    add_mb.pack(side="left", padx=3)
-    ttk.Button(btn_frame, text="Remove", command=remove_selected).pack(side="left", padx=3)
-    ttk.Button(btn_frame, text="Begin Download", command=begin_download).pack(side="left", padx=3)
-    ttk.Button(btn_frame, text="Cancel", command=cancel_all).pack(side="left", padx=3)
-
-    # RIGHT cluster (4, packed right-to-left => Label & Skin | Sort Only | Repair | Add)
-    ttk.Button(btn_frame, text="Add Asset",
-               command=lambda: open_asset_form(root, "add", cfg, log)).pack(side="right", padx=3)
-    ttk.Button(btn_frame, text="Repair Asset",
-               command=lambda: open_asset_form(root, "repair", cfg, log)).pack(side="right", padx=3)
-    ttk.Button(btn_frame, text="Sort Only", command=sort_only).pack(side="right", padx=3)
-    ttk.Button(btn_frame, text="Label & Skin", command=label_skin_only).pack(side="right", padx=3)
+    # Button row on grid. Every column gets equal weight and each button
+    # stretches to fill (sticky ew) with roomy padding, so the buttons spread
+    # across the whole width instead of clustering with a gap in the middle.
+    _mid_btns = [
+        ("Add Batch", add_batch),
+        ("Remove", remove_selected),
+        ("Begin Download", begin_download),
+        ("Cancel", cancel_all),
+        ("Clear Queue", clear_queue),
+        ("Label & Skin", label_skin_only),
+        ("Sort Only", sort_only),
+        ("Repair Asset", lambda: open_asset_form(root, "repair", cfg, log)),
+        ("Add Asset", lambda: open_asset_form(root, "add", cfg, log)),
+    ]
+    for _c, (_label, _cmd) in enumerate(_mid_btns):
+        ttk.Button(btn_frame, text=_label, command=_cmd).grid(
+            row=0, column=_c, padx=6, sticky="ew")
+        btn_frame.columnconfigure(_c, weight=1)
 
     log("Re:Tentative ready.")
     log(f"Working folder: {SCRIPT_DIR}")
     log("Click ? for the README. First time: set folders in Configuration, "
         "then Save your Civitai API key.")
+
+    # Auto-reload a previously saved queue, if one exists next to the script.
+    _restored = load_saved_queue()
+    if _restored:
+        for _u in _restored:
+            listbox.insert("end", _u)
+        log(f"Restored {len(_restored)} queued URL(s) from _saved_queue.txt.")
 
     # --- first-run onboarding: Configuration, then API key prompt ---
     def first_run_flow():

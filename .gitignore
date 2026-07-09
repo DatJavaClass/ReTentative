@@ -1,5 +1,8 @@
 # Internal / development material, not for release
+# (the changelog's contents are published in README.md instead of this file)
 ToIgnore/
+DEVELOPMENT_LOG.md
+CHANGELOG.md
 
 # Claude-facing handoff and config files
 .claude/

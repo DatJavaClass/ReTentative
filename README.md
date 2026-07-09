@@ -19,7 +19,7 @@ A single-file Python desktop app that keeps a local Stable Diffusion model
 library tidy. It classifies your checkpoints and LoRAs by base model, renames
 them to a consistent `[BaseModel]-Friendly Name` format, downloads a preview
 image when one is missing, sorts freshly-downloaded files into the correct
-folders, and includes a small Civitai download queue.
+folders, and includes a Civitai download queue that persists between sessions.
 
 Zero third-party dependencies: standard-library Python only (`tkinter`,
 `urllib`, `hashlib`, `json`, `threading`). No build step, clone and run.
@@ -50,16 +50,40 @@ land there before being sorted.
 
 | Button | What it does |
 | --- | --- |
-| **Add** (menu) | *Add Clipboard* adds a Civitai URL from your clipboard to the queue. *Add Batch* loads a `.txt` file of URLs, one per line. |
+| **Add Batch** | Load a `.txt` file of Civitai URLs, one per line, into the queue. Non-Civitai lines and duplicates are skipped. |
+| **`+`** / **Ctrl+V** | Add a single Civitai URL from your clipboard. Click the `+` on the queue's top-right corner, or press Ctrl+V with the queue focused. |
 | **Remove** | Remove the selected queue entry. |
-| **Begin Download** | Download everything in the queue into `Downloaded Content`, then sort and label/skin the new files automatically. |
+| **Clear Queue** | Empty the queue and its saved copy. Asks first only if a download is running. |
+| **Begin Download** | Download everything in the queue into `Downloaded Content`, then sort and label/skin the new files automatically. Each file shows a live progress bar. |
 | **Cancel** | Stop after the current file finishes. |
 | **Label & Skin** | Walk your whole library: classify each model, rename it to `[BaseModel]-Friendly Name`, and grab a preview if missing. Safe to run repeatedly; already-named files are skipped. |
 | **Sort Only** | Move loose files out of `Downloaded Content` into the right model folder (VAEs, LoRAs, checkpoints). |
 | **Repair Asset** | Fix one asset by hand. Search your library, pick a file, and correct its base model, name, keywords, or preview. |
-| **Add Asset** | Register a file that did not come from Civitai (HuggingFace, TensorArt, a local merge). It gets labeled and skinned, and added to the exclusion list so the auto-pass leaves it alone. |
+| **Add Asset** | Register a file that did not come from Civitai (HuggingFace, TensorArt, a local merge). Pick it with **Load From Local**; it is labeled, skinned, and added to the exclusion list so the auto-pass leaves it alone. |
+| **Save Queue** | Save the current queue so it reloads automatically on the next launch. |
+| **Export Queue** | Save the queue to a `.txt` you choose (shareable; loads back in via Add Batch). |
 | **Configuration** | Set the three model folder paths. |
 | **Save Key** | Store your Civitai API key. |
+| **Exit** | Close the program. |
+
+## The download queue
+
+The queue is a list of Civitai URLs to fetch. Add to it from a `.txt` file
+(**Add Batch**) or one URL at a time from your clipboard (the `+` button on the
+queue's top-right corner, or **Ctrl+V** with the queue focused). Both paths skip
+non-Civitai lines and duplicates.
+
+The queue survives restarts. **Save Queue** writes it next to the program and it
+reloads automatically the next time you launch. **Export Queue** writes a
+portable copy to a `.txt` you choose, which loads back in through Add Batch.
+**Clear Queue** empties it, and its saved copy, asking first only if a download
+is in progress.
+
+While **Begin Download** runs, each file shows a live, terminal-style progress
+bar in the log (`[####      47%]`) that advances in place. When a file finishes
+it collapses to a single permanent record line (`done: name (147.3 MB)`), so the
+log stays readable instead of filling with frozen bars. A download whose size
+the server does not report falls back to a running byte count.
 
 ## How classification works
 
@@ -72,6 +96,16 @@ For each file the tool tries, in order:
 4. If nothing works, the file is **quarantined**: left completely untouched and
    logged to `_unresolved.txt`. The tool never guesses a base model from a
    filename, so it will never write a wrong label silently.
+
+## Previews
+
+When a model has no preview image, the tool fetches one from its Civitai image
+list. Roughly a third of Civitai previews are videos, so the fetcher prefers a
+real still: it skips video entries and falls through to the next image, and as a
+last resort tries to pull a still frame from a video. Every candidate is checked
+to confirm it is actually an image before it is saved, so a video or an error
+page is never written as a `.preview.png`. If no usable still exists, the model
+is left without a preview rather than with a broken one.
 
 ## Files the tool keeps
 
@@ -125,7 +159,7 @@ capped in length, and each rename is wrapped so one bad file is logged to
 **A file landed in `_unresolved.txt`.** That is the tool working as designed: it
 refused to guess. Usual causes:
 
-- It is not a Civitai file (a local merge, HuggingFace, TensorHub). Register it
+- It is not a Civitai file (a local merge, HuggingFace, TensorArt). Register it
   with **Add Asset**, which labels it and adds it to the exclusion list, or list
   it in `_exclusion_list.txt`.
 - It is a Civitai file whose hash changed (re-saved, pruned, converted). Use
@@ -133,9 +167,11 @@ refused to guess. Usual causes:
 - No API key is set, so checkpoints (which have no sidecar) cannot be
   classified. Set the key with **Save Key**.
 
-**A file classified fine but no preview downloaded.** The model's image list was
-empty, or its first entry was a video rather than a still. Fix it with **Repair
-Asset** and supply a preview by URL, local file, or Browse.
+**A file classified fine but no preview downloaded.** Some Civitai posts are
+video-only. The fetcher automatically skips videos, falls through to the next
+still, and confirms that what it saves is really an image, so a missing preview
+now means no usable still existed at all. Supply one yourself with **Repair
+Asset** by URL, local file, or Browse.
 
 **A file sorted into the wrong folder.** Loose files with no sidecar are sorted
 with a size heuristic, so a rare edge case is possible. New Civitai downloads
@@ -167,3 +203,130 @@ he downloads.
 ## Status
 
 Beta. Developed by Victor.
+
+---
+
+## Changelog
+
+### [0.2.0-beta] - 2026-07-09
+
+First push since the initial release. Adds download-queue persistence and a
+live progress display, rebuilds the Add Asset flow, and fixes two naming and
+preview bugs.
+
+#### Added
+
+- **Download queue persistence and management.**
+  - Save Queue writes the pending list to disk and it auto-reloads into the
+    queue on the next startup.
+  - Export Queue writes a portable `.txt` (one URL per line) that round-trips
+    back in through Add Batch.
+  - Clear Queue empties the list and wipes the saved copy so a restart does not
+    restore a queue you cleared. It only asks for confirmation while a run is
+    active.
+  - Clipboard add is now bound to `Ctrl+V` on the queue and to a small `+`
+    button on the queue frame; both share the same validated, de-duplicated
+    append path.
+  - Added an Exit button to the top row.
+- **Terminal-style live download progress bar.** Each file shows a single
+  in-place bar (`[####      47%]`) that advances as it downloads, then collapses
+  to one permanent record line per file (`done: name (147.3 MB)`, or a
+  cancelled / error line). Widget updates are marshalled to the main thread, and
+  redraws are throttled to whole-percent changes so the UI is not flooded.
+  - Falls back to a byte counter (`[downloading... 47.3 MB]`) when the server
+    sends no Content-Length.
+- **Add Asset: up-front local file picker.** A "Model file" row with a
+  `Load From Local` button lets you choose the `.safetensors` deliberately,
+  first. Its basename seeds the friendly-name field. The picker defaults to your
+  Downloads folder, where non-Civitai files usually land.
+- **Preview fetching now tries multiple candidates.** Instead of taking only the
+  first entry in a Civitai `images` array, the fetcher walks the list, prefers
+  real images, and as a last resort attempts a still frame derived from a video
+  entry. Every downloaded candidate is checked by its magic bytes before it is
+  kept.
+
+#### Changed
+
+- **Add Asset severed from the Repair flow.** Add and Repair had shared one form
+  and Add had inherited Repair behavior that did not fit it. The Civitai URL row
+  and Pull-from-URL button are now hidden in Add (they belong only to Repair,
+  where the file is known and the metadata is corrected). Add is now built around
+  the fact that its file is the unknown and its metadata is supplied by hand.
+- Preview files are still saved as `<stem>.preview.png` for A1111
+  compatibility; only the selection and validation logic around them changed.
+
+#### Fixed
+
+- **Double-prefix ("double-dip") naming bug.** Repairing or re-adding a file
+  whose name already carried a base-model tag produced a stacked prefix such as
+  `[Anima]-[Anima] Canopy The Digital Alchemist` or
+  `[Anima]-[Illustrious] An Ban Illus`. The name builder is now idempotent: it
+  strips any existing leading tag off the friendly text before composing, so a
+  second tag can never be bolted on. A standalone repair tool
+  (`fix_double_prefix.py`) for filenames already affected on disk ships
+  alongside the project: run it with no arguments for a simple folder-picker
+  window, or pass the Checkpoint and LoRA folder paths on the command line.
+- **Preview fetch failing on video entries.** Roughly a third of Civitai
+  previews are videos. The old fetcher grabbed the first entry unconditionally,
+  saved the video bytes as `.preview.png`, and the result would not render, which
+  showed up as a high preview-failure rate. Video entries are now skipped in
+  favor of the next real image, and content validation guarantees a video or an
+  error page is never saved as a preview.
+
+#### Notes
+
+- Previews that were already saved incorrectly (video bytes under a `.preview.png`
+  name) are not replaced automatically, because the fetcher skips any file that
+  already has a preview. Delete the bad preview files and re-run Label & Skin to
+  re-pull them.
+
+---
+
+### [0.1.0-beta] - 2026-07-02
+
+Initial public release. A single-file, zero-dependency, clone-and-run tool that
+replaced four ad-hoc utilities (checkpoint and LoRA preview grabbers, a prompt
+extractor, and a model sorter) with one manager.
+
+#### Added
+
+- **Classification ladder with a strict null case.** LoRAs resolve from their
+  `.civitai.info` sidecar first (fast, local). Checkpoints, which have no
+  sidecar, resolve by SHA-256 through Civitai's by-hash API. A page scrape of the
+  `data-next-head` element is the last resort. When nothing authoritative
+  resolves, the file is quarantined and logged to `_unresolved.txt` rather than
+  guessed from its filename.
+- **Label & Skin**, an idempotent mass normalizer that renames models to
+  `[BaseModel]-Friendly Name` and grabs a Civitai preview image. The friendly
+  name comes from Civitai's clean `model.name`, not the mangled download filename.
+- **Sort Only**, which files models into their folders with VAE detection running
+  before the checkpoint branch (fixing the old tool's VAE-into-checkpoints bug).
+- **Download manager** with Add Batch (a `.txt` of URLs, de-duplicated, non-Civitai
+  lines skipped), Begin, and Cancel, plus an exclusion list for non-Civitai files
+  that would otherwise re-log every run.
+- **Repair Asset and Add Asset** breakout forms sharing one backend, with a search
+  bar, status panel, prefill from existing state, and keyword writing to the
+  sidecar.
+- **A base-model dropdown derived from the library** plus a permanent "Other"
+  entry, so a brand-new base model needs zero code change. The tag map is
+  formatting-only, with passthrough for unknown base models.
+- **Config-driven release build** with first-run onboarding (welcome, then folder
+  configuration, then API-key prompt). Working files sit next to the script.
+- Project documentation: `CLAUDE.md`, `README.md`, and a Claude Code handoff
+  guide.
+
+#### Fixed
+
+- **Long-name crash on rename (`WinError 123`).** A Civitai `model.name` of roughly
+  300 characters pushed a path past the Windows MAX_PATH limit and crashed the
+  sweep. Friendly names are now capped at 80 characters, and `rename_with_siblings`
+  wraps each rename so one bad file logs and the sweep continues instead of
+  aborting.
+
+#### Changed
+
+- Hardened the network path: request timeout cut from 30s to 8s, retry with
+  backoff on HTTP 429, and every network exception (not just `HTTPError`) routes to
+  quarantine-and-continue. A `_skip_cache.json` keeps files that 404 once from
+  being re-hashed on every run.
+- README updated with a mascot header and status badges.
