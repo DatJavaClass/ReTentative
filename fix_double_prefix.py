@@ -1,38 +1,8 @@
 #!/usr/bin/env python3
-"""
-fix_double_prefix.py  --  one-shot repair for Re:Tentative's double-dip bug.
+"""One-shot repair for Re:Tentative's double-prefix naming bug. See repo README.
 
-Some early Re:Tentative builds, when Repairing or re-Adding a file whose name
-already carried a base-model tag, prepended a SECOND tag, producing:
-    [Anima]-[Anima] Canopy The Digital Alchemist
-    [Anima]-[Illustrious] An Ban Illus
-    [Pony]-[Pony] KN Animi x Pony XL
-The second bracket group onward is the true name. This tool peels the erroneous
-leading "[X]-" (a leading tag dash-joined to a following bracket) and leaves the
-true name untouched. The model file and every sibling (.preview.png,
-.civitai.info, .json, ...) are renamed together.
-
-TWO WAYS TO RUN
-
-  Double-click it, or run it with no arguments, to open a small window: pick your
-  Checkpoint folder and your LoRA folder, then click Run Fix. It shows exactly
-  what it will rename and asks you to confirm before touching anything.
-
-      python fix_double_prefix.py
-
-  Or drive it from the command line (for scripting). Dry run by default; add
-  --apply to actually rename:
-
-      python fix_double_prefix.py "CKPT_DIR" "LORA_DIR"           # preview only
-      python fix_double_prefix.py "CKPT_DIR" "LORA_DIR" --apply   # do the renames
-
-SAFETY
-  - Nothing is renamed until you confirm (window) or pass --apply (command line).
-    A preview is always shown first.
-  - Only the exact double-prefix signature "[X]-[" is touched. Correctly named
-    files (a single tag, whether "[Base] Name" or "[Base]-Name") are left alone.
-  - Never clobbers: if a target name already exists, that item is skipped and
-    flagged so you can resolve it by hand. Nothing is overwritten or deleted.
+Bare launch = GUI folder picker; folder args run headless (dry-run, --apply to
+rename). Peels a leading "[X]-" tag off the model file and siblings, never clobbers.
 """
 
 import os
@@ -41,16 +11,13 @@ import sys
 
 MODEL_EXTS = {".safetensors", ".ckpt", ".pt"}
 
-# The double-dip signature: a leading "[tag]-" immediately followed by another
-# "[". That dash-join is the artifact the bug introduced; the true names use a
-# space after their bracket, so they never match this.
+## Bug signature: leading "[tag]-" dash-joined to another "[".
+## True names space after "]", never match.
 _DOUBLE_PREFIX = re.compile(r"^\[[^\[\]]*\]-(?=\[)")
 
 
 def corrected_stem(stem):
-    """Peel every leading erroneous '[X]-' prefix. Loops so an accidental
-    triple ('[A]-[B]-[C] name') collapses to the single true tag. Stops the
-    moment the leading tag is not dash-joined to another bracket."""
+    """Peel every leading "[X]-" prefix; loops so triples collapse too."""
     new = stem
     while _DOUBLE_PREFIX.match(new):
         new = _DOUBLE_PREFIX.sub("", new, count=1)
@@ -58,17 +25,14 @@ def corrected_stem(stem):
 
 
 def siblings_of(folder, old_stem):
-    """Every file in folder that belongs to old_stem: the model file and its
-    sidecars (anything named old_stem or starting with old_stem + '.')."""
+    """Model file plus its sidecars (old_stem or old_stem + ".")."""
     for fname in os.listdir(folder):
         if fname == old_stem or fname.startswith(old_stem + "."):
             yield fname
 
 
 def plan_folder(folder, log=print):
-    """Return (renames, collisions) for one folder. renames is a list of
-    (src_name, dst_name); collisions is a list of (src_name, dst_name) where
-    the destination already exists and must be skipped."""
+    """Return (renames, collisions) for one folder; collisions = target exists."""
     renames, collisions = [], []
     if not folder:
         return renames, collisions
@@ -76,7 +40,7 @@ def plan_folder(folder, log=print):
         log(f"  (skip, not a directory: {folder})")
         return renames, collisions
 
-    # Key off the model files so previews/sidecars follow their model.
+    ## Key off model files; sidecars follow their model.
     model_stems = set()
     for fname in os.listdir(folder):
         stem, ext = os.path.splitext(fname)
@@ -86,9 +50,9 @@ def plan_folder(folder, log=print):
     for old_stem in sorted(model_stems, key=str.lower):
         new_stem = corrected_stem(old_stem)
         if new_stem == old_stem:
-            continue   # not double-prefixed, leave it alone
+            continue ## not double-prefixed, leave it alone
         for fname in siblings_of(folder, old_stem):
-            suffix = fname[len(old_stem):]      # ".safetensors", ".preview.png", ...
+            suffix = fname[len(old_stem):] ## ".safetensors", ".preview.png", ...
             dst = new_stem + suffix
             if os.path.exists(os.path.join(folder, dst)):
                 collisions.append((fname, dst))
@@ -98,8 +62,7 @@ def plan_folder(folder, log=print):
 
 
 def scan(dirs, log=print):
-    """Dry-run scan across several folders. Returns a list of per-folder results
-    ({folder, renames, collisions}) and logs a readable preview through `log`."""
+    """Dry-run scan; logs a preview, returns per-folder results."""
     results = []
     for folder in dirs:
         if not folder:
@@ -119,8 +82,7 @@ def scan(dirs, log=print):
 
 
 def apply_results(results, log=print):
-    """Perform the renames in `results` (the output of scan). Returns
-    (done, failed)."""
+    """Perform the renames from scan(); returns (done, failed)."""
     done = failed = 0
     for r in results:
         folder = r["folder"]
@@ -140,7 +102,7 @@ def _counts(results):
     return renamed, collisions
 
 
-# --------------------------------------------------------------------------- CLI
+## cli
 
 def main_cli(argv):
     apply = "--apply" in argv
@@ -167,7 +129,7 @@ def main_cli(argv):
               "for the window) to perform these renames.")
 
 
-# --------------------------------------------------------------------------- GUI
+## gui
 
 def main_gui():
     import tkinter as tk
@@ -177,7 +139,7 @@ def main_gui():
     root.title("Re:Tentative  -  Double-Prefix Fix")
     root.minsize(660, 480)
     root.columnconfigure(0, weight=1)
-    root.rowconfigure(3, weight=1)   # the log pane grows
+    root.rowconfigure(3, weight=1) ## the log pane grows
 
     intro = (
         "Repairs the old double-prefix naming bug: names like "
@@ -188,8 +150,7 @@ def main_gui():
     tk.Label(root, text=intro, justify="left", anchor="w", wraplength=620).grid(
         row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
 
-    ckpt_var = tk.StringVar()
-    lora_var = tk.StringVar()
+    ckpt_var, lora_var = tk.StringVar(), tk.StringVar()
 
     def _folder_row(parent, label, var):
         frame = tk.Frame(parent)
@@ -228,8 +189,7 @@ def main_gui():
         log.configure(state="disabled")
 
     def run_fix():
-        ckpt = ckpt_var.get().strip()
-        lora = lora_var.get().strip()
+        ckpt, lora = ckpt_var.get().strip(), lora_var.get().strip()
         dirs = [d for d in (ckpt, lora) if d]
         if not dirs:
             messagebox.showerror("No folders",
@@ -282,7 +242,7 @@ def main_gui():
 
 
 if __name__ == "__main__":
-    # Folder path given on the command line -> headless CLI. No arguments -> GUI.
+    ## Folder args -> CLI. No args -> GUI.
     positional = [a for a in sys.argv[1:] if not a.startswith("-")]
     if positional:
         main_cli(sys.argv[1:])
