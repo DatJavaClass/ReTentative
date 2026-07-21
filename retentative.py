@@ -99,6 +99,29 @@ BY_HASH    = "https://civitai.com/api/v1/model-versions/by-hash/{}"
 MODEL_PAGE = "https://civitai.com/models/{}"
 
 # ----------------------------------------------------------------------------
+# REDIRECT AUTH FIX
+#   Civitai's /api/download/... endpoint 302-redirects to a pre-signed S3-style
+#   CDN URL (Cloudflare R2 / Backblaze b2) whose auth lives in the query-string
+#   signature. Python's urllib copies every header except content-length and
+#   content-type onto the redirected request, so our "Authorization: Bearer
+#   <key>" rides along to the CDN host. A pre-signed GET that ALSO carries an
+#   Authorization header is two auth mechanisms on one request, and the storage
+#   backend rejects it with 400 Bad Request. Strip the header on any redirect
+#   that leaves civitai.com: it still authenticates the civitai.com leg (needed
+#   for login-required models) and is gone before the CDN leg where it 400s.
+# ----------------------------------------------------------------------------
+class _CivitaiRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None:
+            host = (urllib.parse.urlparse(newurl).hostname or "").lower()
+            if not host.endswith("civitai.com"):
+                new.remove_header("Authorization")
+        return new
+
+_OPENER = urllib.request.build_opener(_CivitaiRedirectHandler())
+
+# ----------------------------------------------------------------------------
 # BASE MODEL -> BRACKET TAG  (formatting only; NOT a gate on allowed values)
 #   Maps known Civitai baseModel strings to a tidy bracket tag. Anything not
 #   listed passes through verbatim as [Whatever] -- so a brand-new base model
@@ -274,7 +297,7 @@ def http_download(url, dest_path, api_key=None, timeout=120, cancel_flag=None,
     req = urllib.request.Request(url, headers={"User-Agent": "retentative/1.0"})
     if api_key:
         req.add_header("Authorization", f"Bearer {api_key}")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _OPENER.open(req, timeout=timeout) as resp:
         total = int(resp.headers.get("Content-Length", 0))
         done = 0
         tmp = dest_path + ".part"
