@@ -38,52 +38,95 @@ python retentative.py
 
 ## First-time setup
 
-1. Click **Configuration** and point the tool at your three model folders:
-   Checkpoints, LoRA, and VAE.
-2. Paste your Civitai API key and click **Save Key**. The key lets the tool
-   read model metadata and download previews without rate-limit stalls.
+1. Open **Tools, Configuration** and point the tool at your three model
+   folders: Checkpoints, LoRA, and VAE.
+2. Open **Tools, API Key**, paste your Civitai API key and click **Save**. The
+   key lets the tool read model metadata and download previews without
+   rate-limit stalls.
 
 A `Downloaded Content` folder is created next to the program; new downloads
-land there before being sorted.
+land there before being sorted. Set a **Staging folder** in Configuration to
+have them land somewhere else instead.
 
 ## The buttons
 
+The window has four tabs, a log pane underneath, and three menus.
+
+### Download tab
+
 | Button | What it does |
 | --- | --- |
-| **Add Batch** | Load a `.txt` file of Civitai URLs, one per line, into the queue. Non-Civitai lines and duplicates are skipped. |
-| **`+`** / **Ctrl+V** | Add a single Civitai URL from your clipboard. Click the `+` on the queue's top-right corner, or press Ctrl+V with the queue focused. |
-| **Remove** | Remove the selected queue entry. |
-| **Clear Queue** | Empty the queue and its saved copy. Asks first only if a download is running. |
-| **Begin Download** | Download everything in the queue into `Downloaded Content`, then sort and label/skin the new files automatically. Each file shows a live progress bar. |
-| **Cancel** | Stop after the current file finishes. |
-| **Label & Skin** | Walk your whole library: classify each model, rename it to `[BaseModel]-Friendly Name`, and grab a preview if missing. Safe to run repeatedly; already-named files are skipped. |
-| **Sort Only** | Move loose files out of `Downloaded Content` into the right model folder (VAEs, LoRAs, checkpoints). |
+| **Add URL** | Queue one link by hand. A Civitai URL needs nothing else. For any other host, give a name, base model and kind so the file can be labeled, plus an optional preview image URL and keywords. |
+| **Add Batch** | Load a `.txt` of URLs (one per line) or a `.json` queue. Duplicates are skipped. |
+| **Paste** / **Ctrl+V** | Add every URL on your clipboard, one per line. Duplicates are skipped. |
+| **Remove** / **Delete key** | Remove the selected queue entries. |
+| **Clear** | Empty the queue and its saved copy. Asks first only if a download is running. |
+| **Begin Download** | Download the queue into the staging folder, several files at a time, then sort and label/skin the new files. The Active downloads table shows size, progress and speed per file. |
+
+### Library tab
+
+| Button | What it does |
+| --- | --- |
+| **Label & Skin** | Walk your whole library: classify each model, rename it to `[BaseModel]-Friendly Name (Version)`, and grab a preview if missing. Safe to run repeatedly; already-named files are skipped. |
+| **Relabel versions** (checkbox) | With this ticked, Label & Skin also renames already-labeled files that have no version in their name. |
+| **Sort Only** | Move loose files out of the staging folder into the right model folder (VAEs, LoRAs, checkpoints). |
+| **Find Duplicates** | List files with identical contents, matched by SHA-256. Click a file in the list to mark it. |
+| **Delete Selected** | Delete the marked duplicates. At least one copy in each group must stay unmarked. |
+
+### Repair tab
+
+| Button | What it does |
+| --- | --- |
 | **Repair Asset** | Fix one asset by hand. Search your library, pick a file, and correct its base model, name, keywords, or preview. |
 | **Add Asset** | Register a file that did not come from Civitai (HuggingFace, TensorArt, a local merge). Pick it with **Load From Local**; it is labeled, skinned, and added to the exclusion list so the auto-pass leaves it alone. |
-| **Save Queue** | Save the current queue so it reloads automatically on the next launch. |
-| **Export Queue** | Save the queue to a `.txt` you choose (shareable; loads back in via Add Batch). |
-| **Configuration** | Set the three model folder paths. |
-| **Save Key** | Store your Civitai API key. |
-| **Exit** | Close the program. |
+| **Update Database** | Ask Civitai about every orphan (a library file with no model and version id) by its hash. |
+
+### Pruner tab
+
+One sub-tab each for Checkpoints, LoRA and VAE, with a search box and a preview.
+
+| Button | What it does |
+| --- | --- |
+| **Previous** / **Next** | Step through the list. |
+| **Delete** | Remove the selected model and the files that belong to it (preview, sidecars). Asks first. Files go to the Recycle Bin where one is available, otherwise they are deleted for good, and the prompt says which. |
+
+### Log pane
+
+| Button | What it does |
+| --- | --- |
+| **Cancel** | Stop the running job at the next safe point. Partly downloaded files are kept and resume on the next run. |
+
+### Menus
+
+| Menu item | What it does |
+| --- | --- |
+| **File, Save Queue** | Save the current queue so it reloads automatically on the next launch. |
+| **File, Export Queue** | Save the queue to a `.json` or `.txt` you choose (shareable; loads back in via Add Batch). |
+| **File, Import** | Same as Add Batch. |
+| **File, Exit** | Close the program. |
+| **Tools, Configuration** | Set the three model folder paths, the staging folder, connections per file, files at once, and whether file names carry the version. |
+| **Tools, API Key** | Store your Civitai API key. |
+| **Tools, Open Downloaded Content** | Open the staging folder. |
+| **Help** | The built-in help text, and About. |
 
 ## The download queue
 
-The queue is a list of Civitai URLs to fetch. Add to it from a `.txt` file
-(**Add Batch**) or one URL at a time from your clipboard (the `+` button on the
-queue's top-right corner, or **Ctrl+V** with the queue focused). Both paths skip
-non-Civitai lines and duplicates.
+The queue is a list of links to fetch, from Civitai or any direct download.
+Add to it from a `.txt` or `.json` file (**Add Batch**), one link at a time with
+**Add URL**, or straight from your clipboard (**Paste**, or **Ctrl+V** with the
+queue focused). Every path skips duplicates.
 
-The queue survives restarts. **Save Queue** writes it next to the program and it
-reloads automatically the next time you launch. **Export Queue** writes a
-portable copy to a `.txt` you choose, which loads back in through Add Batch.
-**Clear Queue** empties it, and its saved copy, asking first only if a download
-is in progress.
+The queue survives restarts. **File, Save Queue** writes it next to the program
+and it reloads automatically the next time you launch. **File, Export Queue**
+writes a portable copy to a `.json` or `.txt` you choose, which loads back in
+through Add Batch. **Clear** empties it, and its saved copy, asking first only
+if a download is in progress.
 
-While **Begin Download** runs, each file shows a live, terminal-style progress
-bar in the log (`[####      47%]`) that advances in place. When a file finishes
-it collapses to a single permanent record line (`done: name (147.3 MB)`), so the
-log stays readable instead of filling with frozen bars. A download whose size
-the server does not report falls back to a running byte count.
+While **Begin Download** runs, the Active downloads table shows each file's
+size, progress and speed, and the status line shows overall speed and time
+left. When a file finishes, the log keeps a single record line
+(`done: name (147.3 MB)`). A download whose size the server does not report
+shows a running byte count instead of a percentage.
 
 ## How classification works
 
@@ -165,7 +208,7 @@ refused to guess. Usual causes:
 - It is a Civitai file whose hash changed (re-saved, pruned, converted). Use
   **Repair Asset** and paste the Civitai URL, or re-download a clean copy.
 - No API key is set, so checkpoints (which have no sidecar) cannot be
-  classified. Set the key with **Save Key**.
+  classified. Set the key under **Tools, API Key**.
 
 **A file classified fine but no preview downloaded.** Some Civitai posts are
 video-only. The fetcher automatically skips videos, falls through to the next
@@ -244,8 +287,7 @@ connections and two files. Other hosts may be more generous.
 
 - The single file became a package of small modules. `retentative.py` is
   still the way in.
-- The window is organized into Download, Library, Repair and Pruner tabs, so
-  the button table above describes the older layout.
+- The window is organized into Download, Library, Repair and Pruner tabs.
 - The Civitai API key is sent only to Civitai's own API host, never to the
   storage host a download is handed off to.
 - File names can carry the version: `[BaseModel]-Friendly Name (Version)`.
