@@ -15,7 +15,7 @@
   <img alt="platforms" src="https://img.shields.io/badge/platforms-Windows%20%C2%B7%20Linux%20%C2%B7%20macOS-8aa6d6">
 </p>
 
-A single-file Python desktop app that keeps a local Stable Diffusion model
+A small Python desktop app that keeps a local Stable Diffusion model
 library tidy. It classifies your checkpoints and LoRAs by base model, renames
 them to a consistent `[BaseModel]-Friendly Name` format, downloads a preview
 image when one is missing, sorts freshly-downloaded files into the correct
@@ -202,11 +202,55 @@ he downloads.
 
 ## Status
 
-Beta. Developed by Victor.
+Beta. Developed by DatJavaClass.
 
 ---
 
 ## Changelog
+
+### [0.3.0-beta] - 2026-11-12
+
+Faster under the hood, but the gas station only pumps so fast.
+
+The download path was rebuilt. Files are now pulled in pieces over several
+connections, several files at a time, and a broken download picks up where it
+stopped. The catch? In testing, Civitai handed over about 10 to 12 MB/s in
+total no matter how many connections asked. So the defaults are a polite two
+connections and two files. Other hosts may be more generous.
+
+#### Added
+
+- **Segmented downloads.** Each file is cut into pieces and pulled over
+  several keep-alive connections at once. Set "Connections per file" (1 to 16)
+  in Configuration.
+- **Several files at once.** Set "Files at once" (1 to 6) in Configuration.
+- **Resume.** A cancelled or dropped download keeps its part file and
+  continues from there on the next run.
+- **Integrity check.** A finished file is compared with the SHA-256 Civitai
+  publishes. A mismatch is set aside as `.corrupt` and stays in the queue.
+- **Staging folder setting.** Downloads can land on the same drive as your
+  model folders, which makes sorting instant.
+- **Active downloads table** with size, progress and speed per file, plus
+  overall speed and time left in the status line.
+- **Headless downloads:** `python retentative.py get <url> [more urls]`.
+- **Downloads from any direct link**, with an optional preview image URL,
+  keywords, name, base model and kind.
+- **Duplicate finder** (exact, by SHA-256), **Update Database** under Repair,
+  and a **Pruner** tab.
+- A test suite (`python -m unittest discover -s tests`) and a small benchmark
+  (`python tools/bench.py`).
+
+#### Changed
+
+- The single file became a package of small modules. `retentative.py` is
+  still the way in.
+- The window is organized into Download, Library, Repair and Pruner tabs, so
+  the button table above describes the older layout.
+- The Civitai API key is sent only to Civitai's own API host, never to the
+  storage host a download is handed off to.
+- File names can carry the version: `[BaseModel]-Friendly Name (Version)`.
+
+---
 
 ### [0.2.0-beta] - 2026-07-09
 

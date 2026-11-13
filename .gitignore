@@ -19,3 +19,13 @@ Downloaded Content/
 # Python
 __pycache__/
 *.py[cod]
+
+# Re:Tentative 0.3 runtime files
+_library.json
+_saved_queue.json
+_saved_queue.txt
+list.json
+list.txt
+*.part
+*.part.json
+*.corrupt
